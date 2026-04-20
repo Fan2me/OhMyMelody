@@ -6,7 +6,10 @@ import {
   type PredictionCacheEntry,
 } from "@ohm/core/cache/cache.js";
 import { getModuleLogger } from "@ohm/core/logging/logger.js";
-import { normalizeCoreModelName } from "@ohm/core/model-catalog.js";
+import {
+  normalizeCoreModelName,
+  resolveCoreModelUrl,
+} from "@ohm/core/model-catalog.js";
 import type { WorkerLike } from "@ohm/core/cfp/types.js";
 import type { InferenceProgress, InferenceResult } from "../analysis.js";
 
@@ -19,6 +22,7 @@ const defaultWorkerScriptUrl = new URL(
 type InferenceWorkerInitMessage = {
   cmd: "init";
   modelName: string;
+  modelUrl: string;
 };
 
 type InferenceWorkerResetMessage = {
@@ -306,9 +310,11 @@ export class InferenceManager {
     inferenceLogger.info(
       `runtime inference worker init begin: model=${safeModelName} timeoutMs=${this.workerInitTimeoutMs}`,
     );
+    const modelUrl = resolveCoreModelUrl(safeModelName);
     const initMessage: InferenceWorkerInitMessage = {
       cmd: "init",
       modelName: safeModelName,
+      modelUrl,
     };
     await new Promise<void>((resolve, reject) => {
       let settled = false;

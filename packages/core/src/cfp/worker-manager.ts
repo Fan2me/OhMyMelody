@@ -31,7 +31,11 @@ export function createCFPWorkerManager({
     } catch {}
   }
 
-  async function waitWorkerInit(worker: WorkerLike, timeoutMs = 30000): Promise<boolean> {
+  async function waitWorkerInit(
+    worker: WorkerLike,
+    timeoutMs = 30000,
+    onFailure?: (reason: string) => void,
+  ): Promise<boolean> {
     if (!worker) {
       return false;
     }
@@ -39,7 +43,7 @@ export function createCFPWorkerManager({
     return await new Promise<boolean>((resolve) => {
       let settled = false;
       let timeout: ReturnType<typeof setTimeout> | null = null;
-      const finish = (ok: boolean) => {
+      const finish = (ok: boolean, reason?: string) => {
         if (settled) {
           return;
         }
@@ -50,6 +54,10 @@ export function createCFPWorkerManager({
         }
         worker.removeEventListener("message", onmsg);
         worker.removeEventListener("error", onerror);
+        worker.removeEventListener("messageerror", onmessageerror);
+        if (!ok && reason) {
+          onFailure?.(reason);
+        }
         resolve(ok);
       };
       const onmsg = (ev: MessageEvent<CFPWorkerMessage>) => {
@@ -62,13 +70,25 @@ export function createCFPWorkerManager({
           return;
         }
         if (message.cmd === "error") {
-          finish(false);
+          const reason =
+            typeof message.error === "string" && message.error
+              ? message.error
+              : "CFP worker init reported an error";
+          finish(false, reason);
         }
       };
-      const onerror = () => finish(false);
-      timeout = setTimeout(() => finish(false), ms);
+      const onerror = (event: ErrorEvent) => {
+        const reason =
+          event?.message ||
+          (event?.error instanceof Error ? event.error.message : "") ||
+          "CFP worker runtime error";
+        finish(false, reason);
+      };
+      const onmessageerror = () => finish(false, "CFP worker messageerror");
+      timeout = setTimeout(() => finish(false, `CFP worker init timed out after ${ms}ms`), ms);
       worker.addEventListener("message", onmsg);
       worker.addEventListener("error", onerror);
+      worker.addEventListener("messageerror", onmessageerror);
       try {
         const pyodideIndexURL = resolvePyodideIndexURL();
         worker.postMessage({
@@ -78,7 +98,7 @@ export function createCFPWorkerManager({
           pyodideScriptUrl: resolvePyodideScriptUrl(pyodideIndexURL),
         });
       } catch {
-        finish(false);
+        finish(false, "CFP worker init postMessage failed");
       }
     });
   }

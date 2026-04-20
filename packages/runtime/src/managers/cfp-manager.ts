@@ -30,10 +30,6 @@ const PYODIDE_CDN_VERSION = "0.25.1";
 const defaultPyodideScriptUrl = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_CDN_VERSION}/full/pyodide.js`;
 const defaultPyodideIndexURL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_CDN_VERSION}/full/`;
 const defaultCFPScriptUrl = new URL("../../../core/cfp.py", import.meta.url).toString();
-const defaultWorkerModuleUrl = new URL(
-  "../../../core/dist/cfp/worker.js",
-  import.meta.url,
-).toString();
 const cfpCacheBackend = "runtime-v2";
 
 type PyodideWorkerLike = PyodideLike & {
@@ -342,10 +338,10 @@ function resolveAnalysisFileKey(input: AnalyzeInput): string {
 
 export interface CFPManagerOptions {
   label?: string;
-  workerModuleUrl?: string | URL;
   pyodideScriptUrl?: string;
   pyodideIndexURL?: string;
   cfpScriptUrl?: string;
+  createWorkerInstance?: (() => WorkerLike) | undefined;
 }
 
 export interface CFPCheckCacheInput {
@@ -376,10 +372,10 @@ export interface CFPProcessResult {
 
 export class CFPManager {
   private readonly analyzerLabel: string;
-  private readonly workerModuleUrl: string | URL;
   private readonly pyodideScriptUrl: string;
   private readonly pyodideIndexURL: string;
   private readonly cfpScriptUrl: string;
+  private readonly createWorkerInstance: (() => WorkerLike) | undefined;
   private readonly cache: CFPIndexedDBCache;
   private readonly workerManager: ReturnType<typeof createCFPWorkerManager>;
   private residentWorker: WorkerLike | null = null;
@@ -395,18 +391,18 @@ export class CFPManager {
 
   constructor({
     label = "runtime",
-    workerModuleUrl = defaultWorkerModuleUrl,
     pyodideScriptUrl = defaultPyodideScriptUrl,
     pyodideIndexURL = defaultPyodideIndexURL,
     cfpScriptUrl = defaultCFPScriptUrl,
+    createWorkerInstance,
   }: CFPManagerOptions = {}) {
     this.analyzerLabel = String(label || "runtime").trim() || "runtime";
-    this.workerModuleUrl = workerModuleUrl;
     this.pyodideScriptUrl = pyodideScriptUrl;
     this.pyodideIndexURL = pyodideIndexURL;
     this.cfpScriptUrl = cfpScriptUrl;
+    this.createWorkerInstance = createWorkerInstance;
     cfpLogger.info(
-      `runtime cfp manager ready: worker=${String(this.workerModuleUrl)} pyodide=${this.pyodideScriptUrl} cfp=${this.cfpScriptUrl}`,
+      `runtime cfp manager ready: worker=${String(new URL("../../../core/dist/cfp/worker.js", import.meta.url))} pyodide=${this.pyodideScriptUrl} cfp=${this.cfpScriptUrl}`,
     );
     this.cache = new CFPIndexedDBCache({
       normalizeCFPBatches: normalizeCFPBatches,
@@ -414,9 +410,18 @@ export class CFPManager {
     this.workerManager = createCFPWorkerManager({
       disableWorker: typeof Worker === "undefined",
       createWorkerInstance: () => {
+        if (this.createWorkerInstance) {
+          try {
+            return this.createWorkerInstance();
+          } catch {
+            return null;
+          }
+        }
         try {
-          const workerUrl = new URL(String(this.workerModuleUrl), import.meta.url);
-          return new Worker(workerUrl, { type: "module" });
+          return new Worker(
+            new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url),
+            { type: "module" },
+          );
         } catch {
           return null;
         }
@@ -428,8 +433,8 @@ export class CFPManager {
     void this.workerManager.prewarmCFPWorker().then((ready) => {
       cfpLogger.info(
         ready
-          ? `runtime cfp worker prewarm ready: ${String(this.workerModuleUrl)}`
-          : `runtime cfp worker prewarm skipped or unavailable: ${String(this.workerModuleUrl)}`,
+          ? `runtime cfp worker prewarm ready: ${String(new URL("../../../core/dist/cfp/worker.js", import.meta.url))}`
+          : `runtime cfp worker prewarm skipped or unavailable: ${String(new URL("../../../core/dist/cfp/worker.js", import.meta.url))}`,
       );
     });
   }
@@ -476,15 +481,6 @@ export class CFPManager {
     };
   }
 
-  private createWorkerInstance(): WorkerLike | null {
-    try {
-      const workerUrl = new URL(String(this.workerModuleUrl), import.meta.url);
-      return new Worker(workerUrl, { type: "module" });
-    } catch {
-      return null;
-    }
-  }
-
   private async ensureResidentWorker(
     timeoutMs: number,
   ): Promise<WorkerLike | null> {
@@ -507,18 +503,34 @@ export class CFPManager {
       if (worker) {
         this.residentWorker = worker;
         cfpLogger.info(
-          `runtime cfp resident worker ready: ${String(this.workerModuleUrl)}`,
+          `runtime cfp resident worker ready: ${String(new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url))}`,
         );
         return worker;
       }
 
-      worker = this.createWorkerInstance();
-      if (!worker) {
+      try {
+        worker = this.createWorkerInstance
+          ? this.createWorkerInstance()
+          : new Worker(
+              new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url),
+              { type: "module" },
+            );
+      } catch {
         return null;
       }
 
-      const ready = await this.workerManager.waitWorkerInit(worker, timeoutMs);
+      let initFailureReason = "";
+      const ready = await this.workerManager.waitWorkerInit(
+        worker,
+        timeoutMs,
+        (reason) => {
+          initFailureReason = reason;
+        },
+      );
       if (!ready) {
+        cfpLogger.warn(
+          `runtime cfp resident worker init failed: ${String(new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url))}${initFailureReason ? ` reason=${initFailureReason}` : ""}`,
+        );
         this.workerManager.terminateWorkerSafely(worker);
         return null;
       }
@@ -528,7 +540,7 @@ export class CFPManager {
         this.workerManager.setPrewarmedWorker(worker);
       }
       cfpLogger.info(
-        `runtime cfp resident worker ready: ${String(this.workerModuleUrl)}`,
+        `runtime cfp resident worker ready: ${String(new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url))}`,
       );
       return worker;
     })().finally(() => {
@@ -603,18 +615,20 @@ export class CFPManager {
     );
     if (canUseWorker) {
       const worker = await this.ensureResidentWorker(30000);
-      if (!worker) {
-        throw new Error("CFP worker is not available");
+      if (worker) {
+        const workerResults = await runCFPWithResidentWorker({
+          input,
+          worker,
+          signal,
+        });
+        cfpLogger.info(
+          `runtime cfp process done via worker: batches=${workerResults.length}`,
+        );
+        return workerResults;
       }
-      const workerResults = await runCFPWithResidentWorker({
-        input,
-        worker,
-        signal,
-      });
-      cfpLogger.info(
-        `runtime cfp process done via worker: batches=${workerResults.length}`,
+      cfpLogger.warn(
+        "runtime cfp worker unavailable, falling back to main-thread Pyodide",
       );
-      return workerResults;
     }
 
     cfpLogger.warn("runtime cfp falling back to main-thread Pyodide");

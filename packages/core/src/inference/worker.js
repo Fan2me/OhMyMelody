@@ -11,7 +11,8 @@ const MODEL_NAMES = [
   "mftfa_b.onnx",
   "msnet.onnx",
 ];
-const MODEL_URL_BASE = new URL("../../models/", import.meta.url).toString();
+let currentResult = buildEmptyInferenceResult();
+const MODEL_URL_BASE = new URL("../../models/", import.meta.url);
 const MODEL_IO = Object.freeze({
   BATCH: 1,
   T_PER_BATCH: 128,
@@ -66,7 +67,17 @@ function normalizeCoreModelName(value) {
 }
 
 function resolveModelUrl(modelName) {
-  return `${MODEL_URL_BASE}${encodeURIComponent(normalizeCoreModelName(modelName))}`;
+  return new URL(
+    encodeURIComponent(normalizeCoreModelName(modelName)),
+    MODEL_URL_BASE,
+  ).toString();
+}
+
+function normalizeModelUrl(modelName, modelUrl) {
+  if (typeof modelUrl === "string" && modelUrl.trim()) {
+    return modelUrl.trim();
+  }
+  return resolveModelUrl(modelName);
 }
 
 function resolveSessionInputName(nextSession) {
@@ -107,11 +118,11 @@ function loadOrtRuntime(scriptUrl) {
     return Promise.resolve(existing);
   }
 
-  return import(scriptUrl)
+  return import(/* @vite-ignore */ scriptUrl)
     .then((moduleNamespace) => {
       const ort = moduleNamespace?.InferenceSession?.create
         ? moduleNamespace
-        : moduleNamespace?.default ?? null;
+        : (moduleNamespace?.default ?? null);
       if (!ort?.InferenceSession?.create) {
         throw new Error("onnxruntime-web did not register global ort");
       }
@@ -250,7 +261,13 @@ function collectBatchPredictions(outTensor, chunk) {
       B,
       T,
     ),
-    batchConfidence: collectVisibleConfidenceFromScores(outData, chunk, B, F, T),
+    batchConfidence: collectVisibleConfidenceFromScores(
+      outData,
+      chunk,
+      B,
+      F,
+      T,
+    ),
   };
 }
 
@@ -270,11 +287,14 @@ function segmentBatchTo128(batch) {
 
   for (let startT = 0; startT < t0; startT += MODEL_IO.T_PER_BATCH) {
     const validT = Math.min(MODEL_IO.T_PER_BATCH, t0 - startT);
-    const segData = new Float32Array(MODEL_IO.C * MODEL_IO.FREQ * MODEL_IO.T_PER_BATCH);
+    const segData = new Float32Array(
+      MODEL_IO.C * MODEL_IO.FREQ * MODEL_IO.T_PER_BATCH,
+    );
     for (let c = 0; c < useC; c += 1) {
       for (let f = 0; f < useF; f += 1) {
         const srcBase = c * f0 * t0 + f * t0 + startT;
-        const dstBase = c * MODEL_IO.FREQ * MODEL_IO.T_PER_BATCH + f * MODEL_IO.T_PER_BATCH;
+        const dstBase =
+          c * MODEL_IO.FREQ * MODEL_IO.T_PER_BATCH + f * MODEL_IO.T_PER_BATCH;
         for (let t = 0; t < validT; t += 1) {
           segData[dstBase + t] = data[srcBase + t];
         }
@@ -299,7 +319,8 @@ function createResultFromSegments(inputName, batches) {
   const totalConfidence = [];
   let totalExpectedFrames = 0;
   let totalBatchCount = 0;
-  const resolvedInputName = resolveSessionInputName(session) || inputName || "input";
+  const resolvedInputName =
+    resolveSessionInputName(session) || inputName || "input";
 
   return (async () => {
     for (const batch of batches) {
@@ -324,7 +345,10 @@ function createResultFromSegments(inputName, batches) {
           );
         }
         const chunk = [{ validT: segment.validT }];
-        const { batchArgmax, batchConfidence } = collectBatchPredictions(outTensor, chunk);
+        const { batchArgmax, batchConfidence } = collectBatchPredictions(
+          outTensor,
+          chunk,
+        );
         totalArgmax.push(...batchArgmax);
         totalConfidence.push(...batchConfidence);
         totalBatchCount += 1;
@@ -343,7 +367,30 @@ function createResultFromSegments(inputName, batches) {
 }
 
 function getModelUrl(modelName) {
-  return resolveModelUrl(normalizeCoreModelName(modelName));
+  return new URL(
+    encodeURIComponent(normalizeCoreModelName(modelName)),
+    MODEL_URL_BASE,
+  ).toString();
+}
+
+async function logModelFetchSnapshot(modelUrl) {
+  try {
+    const response = await fetch(modelUrl, { cache: "no-store" });
+    const contentType = response.headers.get("content-type") || "unknown";
+    const contentLength = response.headers.get("content-length") || "unknown";
+    const buffer = await response.clone().arrayBuffer();
+    const preview = Array.from(new Uint8Array(buffer.slice(0, 16)))
+      .map((value) => value.toString(16).padStart(2, "0"))
+      .join(" ");
+    logInfo(
+      `model fetch snapshot: url=${modelUrl} status=${response.status} contentType=${contentType} contentLength=${contentLength} preview=${preview}`,
+    );
+  } catch (error) {
+    logWarn(
+      `model fetch snapshot failed: url=${modelUrl}`,
+      error,
+    );
+  }
 }
 
 async function createSessionWithProvider(modelUrl, provider, mode = "default") {
@@ -392,13 +439,19 @@ async function createPrioritySession(modelUrl) {
       logWarn("WebGPU session init failed, falling back to wasm.", error);
     }
   } catch (error) {
-    logWarn("failed to load WebGPU ORT bundle, falling back to wasm bundle.", error);
+    logWarn(
+      "failed to load WebGPU ORT bundle, falling back to wasm bundle.",
+      error,
+    );
   }
 
   try {
     await loadOrtRuntime(wasmScriptUrl);
     const wasmEnvSnapshot = snapshotWasmEnv();
-    const fallbackThreads = Math.max(1, globalThis.navigator?.hardwareConcurrency || 1);
+    const fallbackThreads = Math.max(
+      1,
+      globalThis.navigator?.hardwareConcurrency || 1,
+    );
     const attempts = [
       { proxy: true, numThreads: fallbackThreads, label: "multi" },
       { proxy: false, numThreads: 1, label: "single" },
@@ -408,7 +461,11 @@ async function createPrioritySession(modelUrl) {
       for (const attempt of attempts) {
         applyWasmEnv(attempt);
         try {
-          return await createSessionWithProvider(modelUrl, "wasm", attempt.label);
+          return await createSessionWithProvider(
+            modelUrl,
+            "wasm",
+            attempt.label,
+          );
         } catch (error) {
           lastError = error;
           logWarn(
@@ -424,7 +481,10 @@ async function createPrioritySession(modelUrl) {
       throw lastError;
     }
   } catch (error) {
-    logWarn("wasm provider init failed, falling back to default ORT session.", error);
+    logWarn(
+      "wasm provider init failed, falling back to default ORT session.",
+      error,
+    );
   }
 
   await loadOrtRuntime(wasmScriptUrl);
@@ -450,7 +510,8 @@ self.onmessage = async (ev) => {
 
       currentModelName = normalizeCoreModelName(m.modelName);
       currentResult = buildEmptyInferenceResult();
-      const modelUrl = getModelUrl(m.modelName);
+      const modelUrl = normalizeModelUrl(m.modelName, m.modelUrl);
+      await logModelFetchSnapshot(modelUrl);
       const resolved = await createPrioritySession(modelUrl);
       session = resolved.session;
       providerUsed = resolved.provider;
@@ -459,9 +520,12 @@ self.onmessage = async (ev) => {
       if (!session) throw new Error("session not initialized");
       const id = m.id;
       const batches = Array.isArray(m.batches) ? m.batches : [];
-      const inputName = resolveSessionInputName(session) || m.inputName || "input";
+      const inputName =
+        resolveSessionInputName(session) || m.inputName || "input";
       if (batches.length) {
-        logInfo(`worker process begin: id=${id} model=${currentModelName || "unknown"} batches=${batches.length}`);
+        logInfo(
+          `worker process begin: id=${id} model=${currentModelName || "unknown"} batches=${batches.length}`,
+        );
         const result = await createResultFromSegments(inputName, batches);
         currentResult = result;
         logInfo(
@@ -475,12 +539,15 @@ self.onmessage = async (ev) => {
       if (!ort?.Tensor) {
         throw new Error("onnxruntime-web tensor constructor is unavailable");
       }
-      const shape = Array.isArray(m.shape) && m.shape.length
-        ? m.shape
-        : MODEL_IO.INPUT_SHAPE;
+      const shape =
+        Array.isArray(m.shape) && m.shape.length
+          ? m.shape
+          : MODEL_IO.INPUT_SHAPE;
       const buf = m.buffer;
       const floatData = new Float32Array(buf);
-      const feeds = { [inputName]: new ort.Tensor("float32", floatData, shape) };
+      const feeds = {
+        [inputName]: new ort.Tensor("float32", floatData, shape),
+      };
       const out = await session.run(feeds);
       const outName = session.outputNames && session.outputNames[0];
       const outTensor = out[outName];
@@ -489,8 +556,17 @@ self.onmessage = async (ev) => {
           `模型输出异常，预期[${MODEL_IO.BATCH},361,${MODEL_IO.T_PER_BATCH}]，实际=${outTensor?.dims ? `[${outTensor.dims.join(",")}]` : "unknown"}`,
         );
       }
-      const validT = Math.max(1, Math.min(MODEL_IO.T_PER_BATCH, Number(shape?.[3] || MODEL_IO.T_PER_BATCH)));
-      const { batchArgmax, batchConfidence } = collectBatchPredictions(outTensor, [{ validT }]);
+      const validT = Math.max(
+        1,
+        Math.min(
+          MODEL_IO.T_PER_BATCH,
+          Number(shape?.[3] || MODEL_IO.T_PER_BATCH),
+        ),
+      );
+      const { batchArgmax, batchConfidence } = collectBatchPredictions(
+        outTensor,
+        [{ validT }],
+      );
       const result = {
         totalArgmax: batchArgmax.slice(),
         totalConfidence: batchConfidence.slice(),
