@@ -3,10 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/app.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsc -b --pretty false && node ../scripts/copy-core-runtime-assets.mjs",
+    "build": "vite build",
+    "dev": "vite --host 0.0.0.0 --port 4173",
+    "preview": "vite preview",
     "test": "pnpm --dir .. build && node --test test/browser-worker.mjs",
     "typecheck": "tsc -b --pretty false",
     "lint": "node ../scripts/lint-package.mjs src",
@@ -14,6 +16,7 @@
     "clean": "node ../scripts/clean.mjs"
   },
   "dependencies": {
+    "@ohm/core": "workspace:*",
     "@ohm/runtime": "workspace:*",
     "@ohm/ui": "workspace:*"
   }

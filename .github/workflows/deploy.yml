@@ -35,15 +35,8 @@ jobs:
       - name: Stage GitHub Pages site
         run: |
           rm -rf site
-          mkdir -p site/app site/packages/core site/packages/runtime site/packages/ui
-          cp app/index.html site/app/index.html
-          cp app/sw.js site/app/sw.js
-          cp -R app/dist site/app/
-          cp app/dist/packages/core/cfp.py site/packages/core/cfp.py
-          cp -R packages/core/dist site/packages/core/
-          cp -R packages/core/models site/packages/core/
-          cp -R packages/runtime/dist site/packages/runtime/
-          cp -R packages/ui/dist site/packages/ui/
+          mkdir -p site/app
+          cp -R app/dist/* site/app/
           cat > site/index.html <<'EOF'
           <!doctype html>
           <html lang="zh-CN">
