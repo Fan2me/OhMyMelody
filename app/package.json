@@ -1,0 +1,20 @@
+{
+  "name": "@ohm/app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b --pretty false && node ../scripts/copy-core-runtime-assets.mjs",
+    "test": "pnpm --dir .. build && node --test test/browser-worker.mjs",
+    "typecheck": "tsc -b --pretty false",
+    "lint": "node ../scripts/lint-package.mjs src",
+    "lint:fix": "node ../scripts/lint-package.mjs src --fix",
+    "clean": "node ../scripts/clean.mjs"
+  },
+  "dependencies": {
+    "@ohm/runtime": "workspace:*",
+    "@ohm/ui": "workspace:*"
+  }
+}

@@ -1,0 +1,7 @@
+[
+  "mamba_a.onnx",
+  "mamba_b.onnx",
+  "mftfa_a.onnx",
+  "mftfa_b.onnx",
+  "msnet.onnx"
+]

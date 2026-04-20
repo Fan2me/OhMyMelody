@@ -1,0 +1,71 @@
+name: Deploy static site to GitHub Pages
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10.32.1'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace
+        run: pnpm build
+
+      - name: Stage GitHub Pages site
+        run: |
+          rm -rf site
+          mkdir -p site/app site/packages/core site/packages/runtime site/packages/ui
+          cp app/index.html site/app/index.html
+          cp app/sw.js site/app/sw.js
+          cp -R app/dist site/app/
+          cp app/dist/packages/core/cfp.py site/packages/core/cfp.py
+          cp -R packages/core/dist site/packages/core/
+          cp -R packages/core/models site/packages/core/
+          cp -R packages/runtime/dist site/packages/runtime/
+          cp -R packages/ui/dist site/packages/ui/
+          cat > site/index.html <<'EOF'
+          <!doctype html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <meta http-equiv="refresh" content="0; url=./app/index.html" />
+            <title>Oh My Melody</title>
+            <script>location.replace('./app/index.html');</script>
+          </head>
+          <body></body>
+          </html>
+          EOF
+          touch site/.nojekyll
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact (site)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4

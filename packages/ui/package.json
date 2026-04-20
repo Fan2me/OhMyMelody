@@ -1,0 +1,25 @@
+{
+  "name": "@ohm/ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@ohm/runtime": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -b --pretty false",
+    "typecheck": "tsc -b --pretty false",
+    "test": "pnpm run build && node --test test/index.mjs",
+    "lint": "node ../../scripts/lint-package.mjs src",
+    "lint:fix": "node ../../scripts/lint-package.mjs src --fix",
+    "clean": "node ../../scripts/clean.mjs"
+  }
+}
