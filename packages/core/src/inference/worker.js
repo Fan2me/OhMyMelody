@@ -4,7 +4,7 @@ const DEFAULT_ORT_WEBGPU_SCRIPT_URL = `https://cdn.jsdelivr.net/npm/onnxruntime-
 const DEFAULT_ORT_WASM_SCRIPT_URL = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_CDN_VERSION}/dist/ort.min.mjs`;
 const DEFAULT_ORT_WASM_BASE_URL = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_CDN_VERSION}/dist/`;
 const DEFAULT_MODEL_NAME = "msnet.onnx";
-const MODEL_NAMES = CORE_MODEL_NAMES = [
+const MODEL_NAMES = [
   "mamba_a.onnx",
   "mamba_b.onnx",
   "mftfa_a.onnx",
