@@ -99,6 +99,7 @@ export default defineConfig({
     emptyOutDir: true,
     outDir: resolve(appRoot, "dist"),
     assetsInlineLimit: 0,
+    manifest: "manifest.json",
     rolldownOptions: {
       output: {
         codeSplitting: {
