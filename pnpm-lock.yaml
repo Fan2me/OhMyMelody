@@ -26,6 +26,9 @@ importers:
 
   app:
     dependencies:
+      '@ohm/core':
+        specifier: workspace:*
+        version: link:../packages/core
       '@ohm/runtime':
         specifier: workspace:*
         version: link:../packages/runtime
