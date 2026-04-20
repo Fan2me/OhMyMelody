@@ -1,5 +1,5 @@
 import type { DisplaySamplingConfig } from "./display-sampling.js";
-import type { SpectrumInteractionState } from "./spectrum-state.js";
+import { DIRTY, type SpectrumInteractionState } from "./spectrum-state.js";
 import { getMainViewFrameCount, clampSpectrumZoom, getPlotMetrics } from "./spectrum-layout.js";
 
 export interface SpectrumInteractionControllerDeps {
@@ -13,7 +13,9 @@ export interface SpectrumInteractionControllerDeps {
   setState: (partial: Partial<SpectrumInteractionState>) => void;
   seekAudioTime: (timeSec: number) => void | Promise<void>;
   markAutoPanSuppressed: (nowTs?: number, durationMs?: number) => void;
-  requestSpectrumRedraw: (force?: boolean) => void;
+  requestSpectrumRedraw: (
+    next?: boolean | { force?: boolean; includeOverviewBase?: boolean; dirtyMask?: number },
+  ) => void;
   requestOverviewOverlayRedraw: () => void;
 }
 
@@ -275,7 +277,7 @@ export function createSpectrumInteractionController(
         spectrumHoverX: axisX + x,
         spectrumHoverY: y,
       });
-      requestSpectrumRedraw(false);
+      requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY });
     };
 
     const startInteraction = (e: MouseEvent | PointerEvent | TouchEvent | any) => {
