@@ -121,7 +121,7 @@ const BINS_PER_SEMITONE = 5;
 const MIN_PITCH_NOTE = "C1";
 const MAX_PITCH_NOTE = "C7";
 const MIN_PLAYBACK_RATE = 0.5;
-const MAX_PLAYBACK_RATE = 2;
+const MAX_PLAYBACK_RATE = 3;
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));

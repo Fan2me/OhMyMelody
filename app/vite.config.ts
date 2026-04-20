@@ -58,6 +58,34 @@ export default defineConfig({
   root: appRoot,
   base: "./",
   publicDir: false,
+  resolve: {
+    alias: [
+      {
+        find: /^@ohm\/core\/(.*)$/,
+        replacement: `${resolve(workspaceRoot, "packages/core/src")}/$1`,
+      },
+      {
+        find: /^@ohm\/runtime\/(.*)$/,
+        replacement: `${resolve(workspaceRoot, "packages/runtime/src")}/$1`,
+      },
+      {
+        find: /^@ohm\/ui\/(.*)$/,
+        replacement: `${resolve(workspaceRoot, "packages/ui/src")}/$1`,
+      },
+      {
+        find: "@ohm/core",
+        replacement: resolve(workspaceRoot, "packages/core/src/index.ts"),
+      },
+      {
+        find: "@ohm/runtime",
+        replacement: resolve(workspaceRoot, "packages/runtime/src/index.ts"),
+      },
+      {
+        find: "@ohm/ui",
+        replacement: resolve(workspaceRoot, "packages/ui/src/index.ts"),
+      },
+    ],
+  },
   optimizeDeps: {
     exclude: ["@ohm/core", "@ohm/runtime", "@ohm/ui"],
   },

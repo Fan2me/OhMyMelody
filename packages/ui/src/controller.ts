@@ -254,8 +254,8 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     markAutoPanSuppressed: (nowTs?: number, durationMs?: number) => {
       renderController.markAutoPanSuppressed(nowTs, durationMs);
     },
-    requestSpectrumRedraw: (force = false) => {
-      renderController.requestSpectrumRedraw(force);
+    requestSpectrumRedraw: (next) => {
+      renderController.requestSpectrumRedraw(next);
     },
     requestOverviewOverlayRedraw: () => {
       renderController.requestOverviewOverlayRedraw();
