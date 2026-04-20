@@ -64,6 +64,8 @@ export interface SpectrumUiOptions {
   }>;
   displaySampling?: Partial<DisplaySamplingConfig>;
   pitchRange?: Partial<SpectrumPitchRange>;
+  heatmapWorkerFactory?: (() => Worker | null) | null;
+  heatmapWorkerUrl?: string | URL;
   onStateChange?: ((state: SpectrumUiState) => void) | null;
   onRender?: ((mount: HTMLElement | null, state: SpectrumUiState) => void) | null;
 }

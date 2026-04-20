@@ -211,6 +211,8 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     getInteractionState: () => interactionState,
     mainOverlayRenderer,
     overviewOverlayRenderer,
+    heatmapWorkerFactory: options.heatmapWorkerFactory ?? null,
+    heatmapWorkerUrl: options.heatmapWorkerUrl ?? null,
   });
 
   progressiveVisualizer = createProgressiveSpectrumVisualizer({

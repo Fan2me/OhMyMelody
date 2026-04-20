@@ -58,6 +58,8 @@ export interface SpectrumRenderControllerDeps {
   getInteractionState: () => SpectrumInteractionState;
   mainOverlayRenderer: SpectrumMainOverlayRenderer;
   overviewOverlayRenderer: SpectrumOverviewOverlayRenderer;
+  heatmapWorkerFactory?: (() => Worker | null) | null;
+  heatmapWorkerUrl?: string | URL | null;
 }
 
 const FRAME_SEC = 0.01;
@@ -112,6 +114,8 @@ export function createSpectrumRenderController(
     getInteractionState,
     mainOverlayRenderer,
     overviewOverlayRenderer,
+    heatmapWorkerFactory = null,
+    heatmapWorkerUrl = null,
   } = deps;
 
   let root: HTMLDivElement | null = null;
@@ -311,7 +315,16 @@ export function createSpectrumRenderController(
       return heatmapWorker;
     }
     try {
-      const workerUrl = new URL("./heatmap-render-worker.js", import.meta.url);
+      if (heatmapWorkerFactory) {
+        const nextWorker = heatmapWorkerFactory();
+        if (nextWorker) {
+          heatmapWorker = nextWorker;
+          return heatmapWorker;
+        }
+      }
+      const workerUrl = heatmapWorkerUrl
+        ? new URL(String(heatmapWorkerUrl), import.meta.url)
+        : new URL("./heatmap-render-worker.js?worker", import.meta.url);
       const nextWorker = new Worker(workerUrl, { type: "module" });
       nextWorker.onmessage = (event: MessageEvent<HeatmapRenderResponse>) => {
         const message = event.data || ({} as HeatmapRenderResponse);
@@ -394,8 +407,8 @@ export function createSpectrumRenderController(
     sampleStrideFrames = 1,
     optimizationLevel: HeatmapOptimizationLevel = "u32-region",
   ): boolean {
-    const worker = heatmapWorkerReady ? heatmapWorker : ensureHeatmapWorker();
-    if (!worker || !canvas || !ctx || !timeline) {
+    const worker = heatmapWorkerReady ? heatmapWorker : null;
+    if (!canvas || !ctx || !timeline) {
       return false;
     }
     const signature = buildHeatmapRenderSignature({
@@ -414,6 +427,9 @@ export function createSpectrumRenderController(
     }
     if (inFlightHeatmapSignature[target] === signature) {
       return true;
+    }
+    if (!worker) {
+      return false;
     }
     const alreadyPending = Array.from(pendingHeatmapTargets.values()).some(
       (item) => item.target === target,
