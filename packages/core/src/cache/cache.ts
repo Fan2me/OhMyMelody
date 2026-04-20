@@ -32,6 +32,18 @@ function toPositiveFinite(value: unknown, fallback: number): number {
   return Number.isFinite(next) && next > 0 ? next : fallback;
 }
 
+function toNonNegativeFinite(value: unknown, fallback: number): number {
+  const next = Number(value);
+  return Number.isFinite(next) && next >= 0 ? next : fallback;
+}
+
+function estimateCFPCacheChunkBytes(chunk: CFPCacheChunkRecord): number {
+  const dataBytes = chunk?.data instanceof Float32Array ? chunk.data.byteLength : 0;
+  const shapeLength = Number(chunk?.shape && typeof chunk.shape.length === 'number' ? chunk.shape.length : 0);
+  const shapeBytes = Number.isFinite(shapeLength) && shapeLength > 0 ? Math.floor(shapeLength) * 8 : 0;
+  return dataBytes + shapeBytes + 64;
+}
+
 export class IndexedDBStore {
   private readonly dbName: string;
   private readonly version: number;
@@ -429,6 +441,8 @@ interface CFPCacheMeta {
   chunkCount: number;
   complete: boolean;
   updatedAt: number;
+  lastAccessed: number;
+  byteSize: number;
 }
 
 interface CFPCacheChunkRecord {
@@ -444,6 +458,7 @@ interface CFPCacheChunkRecord {
 type CFPCacheStoreValue = CFPCacheChunkRecord | CFPCacheMeta;
 
 export class CFPIndexedDBCache {
+  private static readonly MAX_CFP_BYTES = 1024 * 1024 * 1024;
   private readonly normalizeCFPBatches: (rawBatches: unknown) => CFPBatch[];
   private readonly cfpStore: IndexedDBStore;
   private readonly predictionStore: IndexedDBStore;
@@ -491,18 +506,55 @@ export class CFPIndexedDBCache {
     chunkCount = 0,
     complete = false,
     updatedAt = Date.now(),
+    lastAccessed = updatedAt,
+    byteSize = 0,
   }: {
     chunkCount?: number;
     complete?: boolean;
     updatedAt?: number;
+    lastAccessed?: number;
+    byteSize?: number;
   } = {}): CFPCacheMeta {
     return {
-      version: 2,
+      version: 3,
       kind: 'chunked',
-      chunkCount: Math.max(0, Math.floor(toPositiveFinite(chunkCount, 0))),
+      chunkCount: Math.max(0, Math.floor(toNonNegativeFinite(chunkCount, 0))),
       complete: complete === true,
-      updatedAt,
+      updatedAt: Math.floor(toNonNegativeFinite(updatedAt, Date.now())),
+      lastAccessed: Math.floor(toNonNegativeFinite(lastAccessed, Date.now())),
+      byteSize: Math.max(0, Math.floor(toNonNegativeFinite(byteSize, 0))),
     };
+  }
+
+  private normalizeCFPCacheMeta(rawMeta: unknown): CFPCacheMeta | null {
+    if (!rawMeta || typeof rawMeta !== 'object') {
+      return null;
+    }
+
+    const typed = rawMeta as {
+      chunkCount?: unknown;
+      complete?: unknown;
+      updatedAt?: unknown;
+      lastAccessed?: unknown;
+      byteSize?: unknown;
+    };
+
+    const updatedAt = Math.floor(toNonNegativeFinite(typed.updatedAt, Date.now()));
+    const lastAccessed = Math.floor(toNonNegativeFinite(typed.lastAccessed, updatedAt));
+    const byteSize = Math.max(0, Math.floor(toNonNegativeFinite(typed.byteSize, 0)));
+    return this.buildCFPCacheMeta({
+      chunkCount: Math.max(0, Math.floor(toNonNegativeFinite(typed.chunkCount, 0))),
+      complete: typed.complete === true,
+      updatedAt,
+      lastAccessed,
+      byteSize,
+    });
+  }
+
+  private getCFPCacheBaseKeyFromMetaKey(metaKey: IDBValidKey): string {
+    return typeof metaKey === 'string' && metaKey.endsWith('::meta')
+      ? metaKey.slice(0, -6)
+      : String(metaKey);
   }
 
   normalizeCFPCacheChunkRecord(
@@ -550,12 +602,178 @@ export class CFPIndexedDBCache {
     return await this.cfpStore.deleteMany('cfp', matchedKeys);
   }
 
+  private async listCFPCacheMetaEntries(): Promise<Array<{ key: string; meta: CFPCacheMeta }>> {
+    const allKeys = await this.cfpStore.listKeys('cfp');
+    const metaKeys = allKeys.filter(
+      (entryKey): entryKey is string => typeof entryKey === 'string' && entryKey.endsWith('::meta'),
+    );
+    if (!metaKeys.length) {
+      return [];
+    }
+
+    const rawMetas = await this.cfpStore.getMany<unknown>('cfp', metaKeys);
+    const entries: Array<{ key: string; meta: CFPCacheMeta }> = [];
+    for (let i = 0; i < metaKeys.length; i += 1) {
+      const metaKey = metaKeys[i];
+      if (typeof metaKey !== 'string') {
+        continue;
+      }
+      const meta = this.normalizeCFPCacheMeta(rawMetas[i]);
+      if (!meta) {
+        continue;
+      }
+      const byteSize =
+        meta.byteSize > 0
+          ? meta.byteSize
+          : await this.estimateCFPCacheByteSizeForKey(
+            this.getCFPCacheBaseKeyFromMetaKey(metaKey),
+            meta.chunkCount,
+          );
+      entries.push({
+        key: this.getCFPCacheBaseKeyFromMetaKey(metaKey),
+        meta: {
+          ...meta,
+          byteSize,
+        },
+      });
+    }
+    return entries;
+  }
+
+  private async estimateCFPCacheByteSizeForKey(key: string, chunkCount: number): Promise<number> {
+    const safeChunkCount = Math.max(0, Math.floor(toNonNegativeFinite(chunkCount, 0)));
+    if (safeChunkCount === 0) {
+      return 0;
+    }
+    const chunkKeys: IDBValidKey[] = [];
+    for (let i = 0; i < safeChunkCount; i += 1) {
+      chunkKeys.push(this.getCFPCacheChunkKey(key, i));
+    }
+    const rawChunks = await this.cfpStore.getMany<unknown>('cfp', chunkKeys);
+    let byteSize = 0;
+    for (let i = 0; i < rawChunks.length; i += 1) {
+      const rawChunk = rawChunks[i];
+      if (typeof rawChunk === 'undefined' || rawChunk === null) {
+        continue;
+      }
+      const normalizedChunk = this.normalizeCFPCacheChunkRecord(rawChunk, i);
+      if (!normalizedChunk) {
+        continue;
+      }
+      byteSize += estimateCFPCacheChunkBytes(normalizedChunk);
+    }
+    return byteSize;
+  }
+
+  private async touchCFPCacheMeta(key: string): Promise<void> {
+    try {
+      const rawMeta = await this.cfpStore.get<unknown>('cfp', this.getCFPCacheMetaKey(key));
+      const meta = this.normalizeCFPCacheMeta(rawMeta);
+      if (!meta) {
+        return;
+      }
+      await this.cfpStore.put('cfp', this.getCFPCacheMetaKey(key), this.buildCFPCacheMeta({
+        chunkCount: meta.chunkCount,
+        complete: meta.complete,
+        updatedAt: meta.updatedAt,
+        lastAccessed: Date.now(),
+        byteSize: meta.byteSize,
+      }));
+    } catch {}
+  }
+
+  private async refreshCFPCacheMeta(
+    key: string,
+    {
+      complete = null,
+    }: {
+      complete?: boolean | null;
+    } = {},
+  ): Promise<CFPCacheMeta | null> {
+    const existingMeta = this.normalizeCFPCacheMeta(
+      await this.cfpStore.get<unknown>('cfp', this.getCFPCacheMetaKey(key)),
+    );
+
+    const expectedChunkCount = Math.max(
+      0,
+      Math.floor(
+        toNonNegativeFinite(
+          existingMeta?.chunkCount ?? 0,
+          0,
+        ),
+      ),
+    );
+    const chunkKeys: IDBValidKey[] = [];
+    for (let i = 0; i < expectedChunkCount; i += 1) {
+      chunkKeys.push(this.getCFPCacheChunkKey(key, i));
+    }
+    const rawChunks = chunkKeys.length ? await this.cfpStore.getMany<unknown>('cfp', chunkKeys) : [];
+    let byteSize = 0;
+    let actualChunkCount = 0;
+    for (let i = 0; i < rawChunks.length; i += 1) {
+      const rawChunk = rawChunks[i];
+      if (typeof rawChunk === 'undefined' || rawChunk === null) {
+        continue;
+      }
+      const normalizedChunk = this.normalizeCFPCacheChunkRecord(rawChunk, i);
+      if (!normalizedChunk) {
+        continue;
+      }
+      byteSize += estimateCFPCacheChunkBytes(normalizedChunk);
+      actualChunkCount += 1;
+    }
+
+    const nextMeta = this.buildCFPCacheMeta({
+      chunkCount: Math.max(expectedChunkCount, actualChunkCount),
+      complete: complete ?? existingMeta?.complete ?? false,
+      updatedAt: Date.now(),
+      lastAccessed: Date.now(),
+      byteSize,
+    });
+    await this.cfpStore.put('cfp', this.getCFPCacheMetaKey(key), nextMeta);
+    return nextMeta;
+  }
+
+  private async enforceCFPCacheBudget(currentKey: string | null = null): Promise<void> {
+    const entries = await this.listCFPCacheMetaEntries();
+    if (!entries.length) {
+      return;
+    }
+
+    let totalBytes = 0;
+    for (const entry of entries) {
+      totalBytes += Math.max(0, Math.floor(entry.meta.byteSize || 0));
+    }
+    if (totalBytes <= CFPIndexedDBCache.MAX_CFP_BYTES) {
+      return;
+    }
+
+    const purgeCandidates = entries
+      .filter((entry) => entry.key !== currentKey)
+      .sort((a, b) => {
+        const accessDelta = a.meta.lastAccessed - b.meta.lastAccessed;
+        if (accessDelta !== 0) return accessDelta;
+        const updateDelta = a.meta.updatedAt - b.meta.updatedAt;
+        if (updateDelta !== 0) return updateDelta;
+        return a.key.localeCompare(b.key);
+      });
+
+    for (const entry of purgeCandidates) {
+      if (totalBytes <= CFPIndexedDBCache.MAX_CFP_BYTES) {
+        break;
+      }
+      await this.deleteCFPCacheEntriesForKey(entry.key);
+      totalBytes -= Math.max(0, Math.floor(entry.meta.byteSize || 0));
+    }
+  }
+
   async getCFPCache(
     key: string,
     { allowPartial = false }: { allowPartial?: boolean } = {},
   ): Promise<CFPBatch[] | null> {
     const directValue = await this.cfpStore.get<CFPBatch[]>('cfp', key);
     if (Array.isArray(directValue)) {
+      void this.touchCFPCacheMeta(key);
       return directValue;
     }
 
@@ -597,6 +815,7 @@ export class CFPIndexedDBCache {
     }
 
     normalizedChunks.sort((a, b) => a.index - b.index);
+    await this.touchCFPCacheMeta(key);
     return normalizedChunks.map(({ data, shape, start, end, index }) => ({
       data,
       shape,
@@ -632,6 +851,8 @@ export class CFPIndexedDBCache {
     });
 
     await this.cfpStore.putMany('cfp', entries);
+    await this.refreshCFPCacheMeta(key, { complete: true });
+    await this.enforceCFPCacheBudget(key);
     return {
       chunkCount: normalizedBatches.length,
       complete: true,
@@ -687,6 +908,10 @@ export class CFPIndexedDBCache {
         }),
       },
     ]);
+    if (complete === true) {
+      await this.refreshCFPCacheMeta(key, { complete: true });
+      await this.enforceCFPCacheBudget(key);
+    }
     return {
       index: safeIndex,
       chunkCount,
@@ -712,14 +937,8 @@ export class CFPIndexedDBCache {
         complete: false,
       };
     }
-    await this.cfpStore.put(
-      'cfp',
-      this.getCFPCacheMetaKey(key),
-      this.buildCFPCacheMeta({
-        chunkCount: safeChunkCount,
-        complete: true,
-      }),
-    );
+    await this.refreshCFPCacheMeta(key, { complete: true });
+    await this.enforceCFPCacheBudget(key);
     return {
       chunkCount: safeChunkCount,
       complete: true,

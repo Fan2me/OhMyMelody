@@ -2,7 +2,7 @@ import {
   CORE_MODEL_DEFAULT_NAME,
   CORE_MODEL_NAMES,
 } from "@ohm/core";
-import { createAnalyzer } from "@ohm/runtime";
+import { CFPManager, createAnalyzer } from "@ohm/runtime";
 import { createSpectrumUi } from "@ohm/ui";
 import type { RepresentativeMode } from "@ohm/ui";
 
@@ -25,6 +25,14 @@ const minUnitsPerSecond = document.getElementById("minUnitsPerSecond") as HTMLSe
 const maxUnitsPerSecond = document.getElementById("maxUnitsPerSecond") as HTMLSelectElement | null;
 const pitchRangeMinNote = document.getElementById("pitchRangeMinNote") as HTMLSelectElement | null;
 const pitchRangeMaxNote = document.getElementById("pitchRangeMaxNote") as HTMLSelectElement | null;
+const playbackRateSlider = document.getElementById("playbackRateSlider") as HTMLInputElement | null;
+const playbackRateValue = document.getElementById("playbackRateValue") as HTMLElement | null;
+const abLoopEnabled = document.getElementById("abLoopEnabled") as HTMLInputElement | null;
+const abLoopStart = document.getElementById("abLoopStart") as HTMLInputElement | null;
+const abLoopEnd = document.getElementById("abLoopEnd") as HTMLInputElement | null;
+const setLoopStartBtn = document.getElementById("setLoopStartBtn") as HTMLButtonElement | null;
+const setLoopEndBtn = document.getElementById("setLoopEndBtn") as HTMLButtonElement | null;
+const clearLoopBtn = document.getElementById("clearLoopBtn") as HTMLButtonElement | null;
 const debugPanelEnabled = document.getElementById("debugPanelEnabled") as HTMLInputElement | null;
 const debugInfo = document.getElementById("debugInfo") as HTMLElement | null;
 const audioPlayer = document.getElementById("audioPlayer") as HTMLAudioElement | null;
@@ -32,11 +40,31 @@ const spectrumCanvasWrapper = document.getElementById("spectrumCanvasWrapper") a
 const uiStatus = document.getElementById("uiStatus") as HTMLElement | null;
 const fileDropHint = document.getElementById("fileDropHint") as HTMLElement | null;
 
-const analyzer = createAnalyzer();
+const analyzer = createAnalyzer(
+  import.meta.env.PROD
+    ? {
+        cfpManager: new CFPManager({
+          createWorkerInstance: () =>
+            new Worker(
+              new URL("../../packages/core/src/cfp/worker.js?worker&inline", import.meta.url),
+              { type: "module" },
+            ),
+          cfpScriptUrl: new URL("../../packages/core/cfp.py", import.meta.url).toString(),
+        }),
+      }
+    : {},
+);
 const ui = createSpectrumUi({
   analyzer,
   mount: spectrumCanvasWrapper,
   audioElement: audioPlayer,
+  heatmapWorkerFactory: import.meta.env.PROD
+    ? () =>
+        new Worker(
+          new URL("../../packages/ui/src/heatmap-render-worker.js?worker", import.meta.url),
+          { type: "module" },
+        )
+    : null,
   sections: {
     main: { enabled: true, overlay: true, fps: 60, overlayFps: 60 },
     overview: { enabled: true, overlay: true, fps: 24, overlayFps: 24 },
@@ -54,6 +82,12 @@ type AppSettings = {
   modelName?: string;
   audioSource?: string;
   usePredictionCache?: boolean;
+  audioPlaybackRate?: number;
+  abLoop?: {
+    enabled?: boolean;
+    start?: number | null;
+    end?: number | null;
+  };
   debugPanelEnabled?: boolean;
   sections?: {
     main?: { enabled?: boolean; fps?: number; overlayFps?: number };
@@ -78,13 +112,36 @@ let lastAnalyzedFile: File | null = null;
 let lockedModelName = "";
 let recordedMicObjectUrl = "";
 let debugRafId: number | null = null;
+let playbackRate = 1;
+let abLoopStartTime: number | null = null;
+let abLoopEndTime: number | null = null;
+let abLoopEnabledState = false;
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const BINS_PER_SEMITONE = 5;
 const MIN_PITCH_NOTE = "C1";
 const MAX_PITCH_NOTE = "C7";
+const MIN_PLAYBACK_RATE = 0.5;
+const MAX_PLAYBACK_RATE = 2;
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function formatAudioTime(seconds: number | null | undefined): string {
+  if (!Number.isFinite(Number(seconds)) || Number(seconds) < 0) {
+    return "未设置";
+  }
+  const safe = Math.max(0, Number(seconds));
+  const totalMillis = Math.round(safe * 1000);
+  const wholeSeconds = Math.floor(totalMillis / 1000);
+  const millis = totalMillis % 1000;
+  const minutes = Math.floor(wholeSeconds / 60);
+  const remainingSeconds = wholeSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+
+function formatPlaybackRate(rate: number): string {
+  return `${clampNumber(Number(rate) || 1, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE).toFixed(2)}x`;
 }
 
 function getSpectrumStrideForZoom({
@@ -251,25 +308,43 @@ function saveAppSettings(next: Partial<AppSettings>): void {
     const merged: AppSettings = {
       ...current,
       ...next,
-      sections: {
-        ...current.sections,
-        ...next.sections,
-        main: {
-          ...current.sections?.main,
-          ...next.sections?.main,
-        },
-        overview: {
-          ...current.sections?.overview,
-          ...next.sections?.overview,
-        },
+    sections: {
+      ...current.sections,
+      ...next.sections,
+      main: {
+        ...current.sections?.main,
+        ...next.sections?.main,
       },
-    };
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(merged));
+      overview: {
+        ...current.sections?.overview,
+        ...next.sections?.overview,
+      },
+    },
+    abLoop: {
+      ...current.abLoop,
+      ...next.abLoop,
+    },
+  };
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(merged));
   } catch {}
 }
 
 function registerAppServiceWorker(): void {
   if (!("serviceWorker" in navigator)) {
+    return;
+  }
+  if (import.meta.env.DEV) {
+    void navigator.serviceWorker.getRegistrations().then(async (registrations) => {
+      await Promise.all(registrations.map((registration) => registration.unregister()));
+      if ("caches" in window) {
+        const keys = await caches.keys();
+        await Promise.all(
+          keys
+            .filter((key) => key.startsWith("ohm-app-"))
+            .map((key) => caches.delete(key)),
+        );
+      }
+    });
     return;
   }
   void navigator.serviceWorker.register("./sw.js").then(async (registration) => {
@@ -359,6 +434,129 @@ function syncPitchRangeConfig(): void {
   });
 }
 
+function readCurrentAudioTime(): number {
+  if (!audioPlayer) {
+    return 0;
+  }
+  const currentTime = Number(audioPlayer.currentTime);
+  return Number.isFinite(currentTime) && currentTime >= 0 ? currentTime : 0;
+}
+
+function normalizeAbLoopPoints(): void {
+  if (abLoopStartTime !== null && abLoopEndTime !== null && abLoopEndTime < abLoopStartTime) {
+    [abLoopStartTime, abLoopEndTime] = [abLoopEndTime, abLoopStartTime];
+  }
+  if (!audioPlayer || !Number.isFinite(Number(audioPlayer.duration)) || Number(audioPlayer.duration) <= 0) {
+    return;
+  }
+  const duration = Number(audioPlayer.duration);
+  if (abLoopStartTime !== null) {
+    abLoopStartTime = clampNumber(abLoopStartTime, 0, duration);
+  }
+  if (abLoopEndTime !== null) {
+    abLoopEndTime = clampNumber(abLoopEndTime, 0, duration);
+  }
+  if (abLoopStartTime !== null && abLoopEndTime !== null && abLoopEndTime <= abLoopStartTime) {
+    abLoopEndTime = Math.min(duration, abLoopStartTime + 0.1);
+  }
+}
+
+function syncAbLoopUi(): void {
+  normalizeAbLoopPoints();
+  if (abLoopEnabled) {
+    abLoopEnabled.checked = abLoopEnabledState;
+  }
+  if (abLoopStart) {
+    abLoopStart.value = formatAudioTime(abLoopStartTime);
+  }
+  if (abLoopEnd) {
+    abLoopEnd.value = formatAudioTime(abLoopEndTime);
+  }
+  if (audioPlayer) {
+    audioPlayer.loop = false;
+  }
+}
+
+function setAbLoopEnabled(enabled: boolean, persist = true): void {
+  abLoopEnabledState = enabled;
+  if (abLoopEnabled) {
+    abLoopEnabled.checked = enabled;
+  }
+  syncAbLoopUi();
+  if (persist) {
+    saveAppSettings({
+      abLoop: {
+        enabled: abLoopEnabledState,
+        start: abLoopStartTime,
+        end: abLoopEndTime,
+      },
+    });
+  }
+}
+
+function setAbLoopPoint(which: "start" | "end", seconds: number | null, persist = true): void {
+  const safeSeconds = Number.isFinite(Number(seconds)) && Number(seconds) >= 0 ? Number(seconds) : null;
+  if (which === "start") {
+    abLoopStartTime = safeSeconds;
+  } else {
+    abLoopEndTime = safeSeconds;
+  }
+  normalizeAbLoopPoints();
+  syncAbLoopUi();
+  if (persist) {
+    saveAppSettings({
+      abLoop: {
+        enabled: abLoopEnabledState,
+        start: abLoopStartTime,
+        end: abLoopEndTime,
+      },
+    });
+  }
+}
+
+function clearAbLoop(persist = true): void {
+  abLoopStartTime = null;
+  abLoopEndTime = null;
+  abLoopEnabledState = false;
+  syncAbLoopUi();
+  if (persist) {
+    saveAppSettings({
+      abLoop: {
+        enabled: false,
+        start: null,
+        end: null,
+      },
+    });
+  }
+}
+
+function applyPlaybackRate(nextRate: number, persist = true): void {
+  const safeRate = clampNumber(Number(nextRate) || 1, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+  playbackRate = safeRate;
+  if (audioPlayer && Math.abs(audioPlayer.playbackRate - safeRate) > 1e-6) {
+    audioPlayer.playbackRate = safeRate;
+  }
+  if (playbackRateSlider) {
+    playbackRateSlider.value = String(safeRate);
+  }
+  if (playbackRateValue) {
+    playbackRateValue.textContent = formatPlaybackRate(safeRate);
+  }
+  if (persist) {
+    saveAppSettings({ audioPlaybackRate: safeRate });
+  }
+}
+
+function snapAudioToAbLoopStart(): void {
+  if (!audioPlayer || abLoopStartTime === null || abLoopEndTime === null || abLoopEndTime <= abLoopStartTime) {
+    return;
+  }
+  if (audioPlayer.currentTime >= abLoopEndTime) {
+    audioPlayer.currentTime = abLoopStartTime;
+    void audioPlayer.play().catch(() => {});
+  }
+}
+
 function setDropHint(active: boolean): void {
   if (!fileDropHint) return;
   fileDropHint.dataset.active = active ? "true" : "false";
@@ -406,7 +604,78 @@ function bindAudioFile(file: File | null): void {
   currentAudioObjectUrl = URL.createObjectURL(file);
   audioPlayer.src = currentAudioObjectUrl;
   audioPlayer.load();
+  applyPlaybackRate(playbackRate, false);
+  syncAbLoopUi();
   log(`音频文件已装载: ${file.name}`);
+}
+
+function handleAudioTimeUpdate(): void {
+  snapAudioToAbLoopStart();
+}
+
+function handleAudioLoadedMetadata(): void {
+  normalizeAbLoopPoints();
+  syncAbLoopUi();
+  applyPlaybackRate(playbackRate, false);
+}
+
+function handlePlaybackRateChange(): void {
+  if (!audioPlayer) {
+    return;
+  }
+  applyPlaybackRate(audioPlayer.playbackRate, true);
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  const tagName = target.tagName.toLowerCase();
+  return tagName === "input" || tagName === "textarea" || tagName === "select" || target.isContentEditable;
+}
+
+function handleGlobalKeyDown(event: KeyboardEvent): void {
+  if (!event.altKey) {
+    return;
+  }
+  const key = String(event.key || "").toLowerCase();
+  if (!key) {
+    return;
+  }
+  if (event.ctrlKey || event.metaKey) {
+    return;
+  }
+
+  const shouldIgnoreEditable = isEditableTarget(event.target);
+  if (shouldIgnoreEditable && key !== "l" && key !== "a" && key !== "b" && key !== "c") {
+    return;
+  }
+
+  if (key === "a" && !event.shiftKey) {
+    event.preventDefault();
+    setAbLoopPoint("start", readCurrentAudioTime());
+    setAbLoopEnabled(true);
+    log(`A 段已设置: ${formatAudioTime(abLoopStartTime)}`);
+    return;
+  }
+  if (key === "b" && !event.shiftKey) {
+    event.preventDefault();
+    setAbLoopPoint("end", readCurrentAudioTime());
+    setAbLoopEnabled(true);
+    log(`B 段已设置: ${formatAudioTime(abLoopEndTime)}`);
+    return;
+  }
+  if (key === "l") {
+    event.preventDefault();
+    setAbLoopEnabled(!abLoopEnabledState);
+    log(`A/B 循环${abLoopEnabledState ? "已开启" : "已关闭"}`);
+    return;
+  }
+  if (key === "c" && event.shiftKey) {
+    event.preventDefault();
+    clearAbLoop();
+    log("A/B 循环已清除");
+  }
 }
 
 async function analyzeCurrentAudio(sourceFile: File): Promise<void> {
@@ -539,6 +808,8 @@ function setRecordedMicFile(file: File | null): void {
     recordedMicObjectUrl = URL.createObjectURL(file);
     audioPlayer.src = recordedMicObjectUrl;
     audioPlayer.load();
+    applyPlaybackRate(playbackRate, false);
+    syncAbLoopUi();
   }
   syncMicButtons();
   if (file) {
@@ -701,6 +972,19 @@ if (pitchRangeMinNote && savedSettings.pitchRange?.minNote) {
 if (pitchRangeMaxNote && savedSettings.pitchRange?.maxNote) {
   pitchRangeMaxNote.value = savedSettings.pitchRange.maxNote;
 }
+const savedAbLoop = savedSettings.abLoop ?? {};
+if (Number.isFinite(savedSettings.audioPlaybackRate)) {
+  playbackRate = clampNumber(Number(savedSettings.audioPlaybackRate), MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+}
+if (typeof savedAbLoop.enabled === "boolean") {
+  abLoopEnabledState = savedAbLoop.enabled;
+}
+if (Number.isFinite(savedAbLoop.start)) {
+  abLoopStartTime = Number(savedAbLoop.start);
+}
+if (Number.isFinite(savedAbLoop.end)) {
+  abLoopEndTime = Number(savedAbLoop.end);
+}
 if (modelNameSelect) {
   saveAppSettings({ modelName: readSelectedModelName() });
 }
@@ -713,6 +997,11 @@ if (usePredictionCacheCheckbox) {
 if (debugPanelEnabled) {
   saveAppSettings({ debugPanelEnabled: debugPanelEnabled.checked });
 }
+applyPlaybackRate(playbackRate, false);
+if (abLoopEnabled) {
+  abLoopEnabled.checked = abLoopEnabledState;
+}
+syncAbLoopUi();
 syncSectionConfig();
 syncPitchRangeConfig();
 ui.setDisplaySampling({
@@ -820,6 +1109,38 @@ if (audioSourceSelect) {
   });
 }
 
+if (playbackRateSlider) {
+  playbackRateSlider.addEventListener("input", () => {
+    applyPlaybackRate(Number(playbackRateSlider.value), true);
+  });
+}
+if (abLoopEnabled) {
+  abLoopEnabled.addEventListener("change", () => {
+    setAbLoopEnabled(abLoopEnabled.checked);
+    log(`A/B 循环${abLoopEnabled.checked ? "已开启" : "已关闭"}`);
+  });
+}
+if (setLoopStartBtn) {
+  setLoopStartBtn.addEventListener("click", () => {
+    setAbLoopPoint("start", readCurrentAudioTime());
+    setAbLoopEnabled(true);
+    log(`A 段已设置: ${formatAudioTime(abLoopStartTime)}`);
+  });
+}
+if (setLoopEndBtn) {
+  setLoopEndBtn.addEventListener("click", () => {
+    setAbLoopPoint("end", readCurrentAudioTime());
+    setAbLoopEnabled(true);
+    log(`B 段已设置: ${formatAudioTime(abLoopEndTime)}`);
+  });
+}
+if (clearLoopBtn) {
+  clearLoopBtn.addEventListener("click", () => {
+    clearAbLoop();
+    log("A/B 循环已清除");
+  });
+}
+
 if (audioFileInput) {
   audioFileInput.addEventListener("change", () => {
     const file = audioFileInput.files && audioFileInput.files[0] ? audioFileInput.files[0] : null;
@@ -848,6 +1169,14 @@ if (exportMicRecordBtn) {
     exportMicRecording();
   });
 }
+
+if (audioPlayer) {
+  audioPlayer.addEventListener("timeupdate", handleAudioTimeUpdate);
+  audioPlayer.addEventListener("loadedmetadata", handleAudioLoadedMetadata);
+  audioPlayer.addEventListener("ratechange", handlePlaybackRateChange);
+}
+
+document.addEventListener("keydown", handleGlobalKeyDown);
 
 function handleDrop(files: File[]): void {
   const file = files[0] || null;

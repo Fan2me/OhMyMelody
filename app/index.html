@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Oh My Melody</title>
+  <link rel="icon" href="./favicon.ico" sizes="any" />
   <meta name="theme-color" content="#1157d8" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
@@ -188,6 +189,14 @@
       color: var(--text);
     }
 
+    input[type="range"] {
+      border: 0;
+      border-radius: 0;
+      padding: 0;
+      background: transparent;
+      accent-color: var(--primary);
+    }
+
     input[type="checkbox"] {
       width: 18px;
       height: 18px;
@@ -198,6 +207,36 @@
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
+    }
+
+    .button-grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .control-value {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 84px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(232, 238, 252, 0.9);
+      color: var(--primary-strong);
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .control-stack {
+      display: grid;
+      gap: 10px;
+      width: 100%;
+    }
+
+    .control-hint-line {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
     }
 
     .media-grid {
@@ -466,6 +505,39 @@
           </div>
 
           <div class="control-group">
+            <h2>播放控制</h2>
+            <div class="control-stack">
+              <label>
+                歌曲速度
+                <input id="playbackRateSlider" type="range" min="0.1" max="3" step="0.05" value="1" />
+              </label>
+              <div class="row">
+                <span class="control-value" id="playbackRateValue">1.00x</span>
+                <label class="checkbox-label">
+                  <input id="abLoopEnabled" type="checkbox" />
+                  启用 A/B 循环
+                </label>
+              </div>
+              <div class="row">
+                <label>
+                  A 段
+                  <input id="abLoopStart" type="text" value="未设置" readonly />
+                </label>
+                <label>
+                  B 段
+                  <input id="abLoopEnd" type="text" value="未设置" readonly />
+                </label>
+              </div>
+              <div class="button-grid three">
+                <button id="setLoopStartBtn" class="secondary" type="button">设为 A</button>
+                <button id="setLoopEndBtn" class="secondary" type="button">设为 B</button>
+                <button id="clearLoopBtn" class="secondary" type="button">清除循环</button>
+              </div>
+              <p class="control-hint-line">快捷键：Alt+A 设 A，Alt+B 设 B，Alt+L 开关循环，Alt+Shift+C 清除 A/B。</p>
+            </div>
+          </div>
+
+          <div class="control-group">
             <h2>显示控制</h2>
             <div class="row">
               <label>
@@ -611,16 +683,6 @@
     </div>
   </div>
 
-  <script type="importmap">
-    {
-      "imports": {
-        "@ohm/core": "../packages/core/dist/index.js",
-        "@ohm/core/": "../packages/core/dist/",
-        "@ohm/runtime": "../packages/runtime/dist/index.js",
-        "@ohm/ui": "../packages/ui/dist/index.js"
-      }
-    }
-  </script>
-  <script type="module" src="./dist/index.js"></script>
+  <script type="module" src="/src/index.ts"></script>
 </body>
 </html>

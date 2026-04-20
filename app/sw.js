@@ -1,4 +1,4 @@
-const CACHE_NAME = "ohm-app-v2";
+const CACHE_NAME = "ohm-app-v3";
 const CACHE_PREFIX = "ohm-app-";
 const CDN_HOSTS = new Set(["cdn.jsdelivr.net"]);
 const PYODIDE_CDN_VERSION = "0.25.1";
