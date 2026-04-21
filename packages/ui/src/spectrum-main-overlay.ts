@@ -194,7 +194,6 @@ export function createSpectrumMainOverlayRenderer(
       1,
       interaction.spectrumW ||
         predictionFrames.length ||
-        state.inference?.visibleArgmax.length ||
         state.inference?.totalArgmax.length ||
         Math.round((interaction.spectrumDuration || fallbackDuration) / FRAME_SEC),
     );

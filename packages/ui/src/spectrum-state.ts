@@ -97,7 +97,6 @@ export interface SpectrumUiDebugState {
   prediction: {
     frameCount: number;
     confidenceCount: number;
-    inferenceVisibleCount: number;
     inferenceTotalCount: number;
   };
   hover: {

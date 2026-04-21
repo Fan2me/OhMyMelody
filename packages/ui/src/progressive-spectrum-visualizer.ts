@@ -6,8 +6,8 @@ export interface ProgressiveSpectrumState {
   spectrumH: number;
   sourceFrameOffset: number;
   windowFrameCount: number;
-  progressiveArgmax: Float32Array;
-  progressiveConfidence: Float32Array;
+  predictionArgmax: Float32Array;
+  predictionConfidence: Float32Array;
   writeFrameOffset: number;
   renderedFrames: number;
 }
@@ -40,11 +40,10 @@ export interface ProgressiveSpectrumVisualizer {
   }): void;
   ensureBase(expectedFrames: number, durationSec?: number, pushToUi?: boolean, preserveExisting?: boolean): void;
   enqueueChunk(one: CFPBatch): void;
-  applyInferenceProgress(args: {
-    visibleArgmax: ArrayLike<number> | null | undefined;
-    visibleConfidence?: ArrayLike<number> | null | undefined;
-    visibleOffset?: number;
-    totalExpectedFrames?: number;
+  applyPredictionChunk(args: {
+    predictionArgmax: ArrayLike<number> | null | undefined;
+    predictionConfidence?: ArrayLike<number> | null | undefined;
+    predictionOffset?: number;
   }): void;
   flush(): void;
   setFrameSec(nextFrameSec: number): void;
@@ -60,16 +59,16 @@ function createBlankProgressiveSpectrumPayload(totalFrames: number, height = DEF
   const spectrumH = Math.max(1, Math.floor(height || DEFAULT_HEIGHT));
   const spectrumData = new Float32Array(spectrumH * spectrumW);
   spectrumData.fill(NaN);
-  const progressiveArgmax = new Float32Array(spectrumW);
-  progressiveArgmax.fill(NaN);
-  const progressiveConfidence = new Float32Array(spectrumW);
-  progressiveConfidence.fill(NaN);
+  const predictionArgmax = new Float32Array(spectrumW);
+  predictionArgmax.fill(NaN);
+  const predictionConfidence = new Float32Array(spectrumW);
+  predictionConfidence.fill(NaN);
   return {
     spectrumData,
     spectrumW,
     spectrumH,
-    progressiveArgmax,
-    progressiveConfidence,
+    predictionArgmax,
+    predictionConfidence,
   };
 }
 
@@ -100,8 +99,8 @@ export function createProgressiveSpectrumVisualizer(
   let totalFrames = 0;
   let height = Math.max(1, Math.floor(spectrumHeight || DEFAULT_HEIGHT));
   let spectrumData = EMPTY_FLOAT32;
-  let progressiveArgmax = EMPTY_FLOAT32;
-  let progressiveConfidence = EMPTY_FLOAT32;
+  let predictionArgmax = EMPTY_FLOAT32;
+  let predictionConfidence = EMPTY_FLOAT32;
   let pendingDurationSec = 0;
   let queued = false;
   const pendingChunks: CFPBatch[] = [];
@@ -111,8 +110,8 @@ export function createProgressiveSpectrumVisualizer(
     spectrumH: height,
     sourceFrameOffset: 0,
     windowFrameCount: 0,
-    progressiveArgmax,
-    progressiveConfidence,
+    predictionArgmax,
+    predictionConfidence,
     writeFrameOffset: 0,
     renderedFrames: 0,
   };
@@ -123,8 +122,8 @@ export function createProgressiveSpectrumVisualizer(
     if (Object.prototype.hasOwnProperty.call(next, "spectrumH")) state.spectrumH = next.spectrumH ?? state.spectrumH;
     if (Object.prototype.hasOwnProperty.call(next, "sourceFrameOffset")) state.sourceFrameOffset = next.sourceFrameOffset ?? state.sourceFrameOffset;
     if (Object.prototype.hasOwnProperty.call(next, "windowFrameCount")) state.windowFrameCount = next.windowFrameCount ?? state.windowFrameCount;
-    if (Object.prototype.hasOwnProperty.call(next, "progressiveArgmax")) state.progressiveArgmax = next.progressiveArgmax ?? state.progressiveArgmax;
-    if (Object.prototype.hasOwnProperty.call(next, "progressiveConfidence")) state.progressiveConfidence = next.progressiveConfidence ?? state.progressiveConfidence;
+    if (Object.prototype.hasOwnProperty.call(next, "predictionArgmax")) state.predictionArgmax = next.predictionArgmax ?? state.predictionArgmax;
+    if (Object.prototype.hasOwnProperty.call(next, "predictionConfidence")) state.predictionConfidence = next.predictionConfidence ?? state.predictionConfidence;
     if (Object.prototype.hasOwnProperty.call(next, "writeFrameOffset")) state.writeFrameOffset = next.writeFrameOffset ?? state.writeFrameOffset;
     if (Object.prototype.hasOwnProperty.call(next, "renderedFrames")) state.renderedFrames = next.renderedFrames ?? state.renderedFrames;
   }
@@ -161,8 +160,8 @@ export function createProgressiveSpectrumVisualizer(
   function ensureBase(expectedFrames: number, durationSec = 0, pushToUi = true, preserveExisting = true) {
     const safeTotalFrames = Math.max(1, Math.min(maxWindowFrames, Math.floor(expectedFrames || 1)));
     const prevData = spectrumData;
-    const prevArgmax = progressiveArgmax;
-    const prevConfidence = progressiveConfidence;
+    const prevArgmax = predictionArgmax;
+    const prevConfidence = predictionConfidence;
     const prevHeight = height;
     totalFrames = safeTotalFrames;
 
@@ -179,22 +178,22 @@ export function createProgressiveSpectrumVisualizer(
         }
       }
       if (prevArgmax.length > 0) {
-        blank.progressiveArgmax.set(prevArgmax.subarray(0, Math.min(prevArgmax.length, blank.progressiveArgmax.length)));
+        blank.predictionArgmax.set(prevArgmax.subarray(0, Math.min(prevArgmax.length, blank.predictionArgmax.length)));
       }
       if (prevConfidence.length > 0) {
-        blank.progressiveConfidence.set(prevConfidence.subarray(0, Math.min(prevConfidence.length, blank.progressiveConfidence.length)));
+        blank.predictionConfidence.set(prevConfidence.subarray(0, Math.min(prevConfidence.length, blank.predictionConfidence.length)));
       }
     }
 
     spectrumData = blank.spectrumData;
-    progressiveArgmax = blank.progressiveArgmax;
-    progressiveConfidence = blank.progressiveConfidence;
+    predictionArgmax = blank.predictionArgmax;
+    predictionConfidence = blank.predictionConfidence;
     syncState({
       spectrumData,
       spectrumW: blank.spectrumW,
       spectrumH: blank.spectrumH,
-      progressiveArgmax,
-      progressiveConfidence,
+      predictionArgmax,
+      predictionConfidence,
       sourceFrameOffset: 0,
       windowFrameCount: 0,
       writeFrameOffset: 0,
@@ -214,8 +213,8 @@ export function createProgressiveSpectrumVisualizer(
         data: blank.spectrumData,
         width: blank.spectrumW,
         height: blank.spectrumH,
-        argmax: blank.progressiveArgmax,
-        confidence: blank.progressiveConfidence,
+        argmax: blank.predictionArgmax,
+        confidence: blank.predictionConfidence,
       });
       requestRedraw({ force: true, includeOverviewBase: true });
     }
@@ -257,8 +256,8 @@ export function createProgressiveSpectrumVisualizer(
             const rowStart = f * state.spectrumW;
             state.spectrumData.copyWithin(rowStart, rowStart + overflow, rowStart + currentCount);
           }
-          state.progressiveArgmax.copyWithin(0, overflow, currentCount);
-          state.progressiveConfidence.copyWithin(0, overflow, currentCount);
+          state.predictionArgmax.copyWithin(0, overflow, currentCount);
+          state.predictionConfidence.copyWithin(0, overflow, currentCount);
           xOffset = currentCount - overflow;
         }
 
@@ -293,32 +292,28 @@ export function createProgressiveSpectrumVisualizer(
     }
   }
 
-  function applyInferenceProgress(args: {
-    visibleArgmax: ArrayLike<number> | null | undefined;
-    visibleConfidence?: ArrayLike<number> | null | undefined;
-    visibleOffset?: number;
-    totalExpectedFrames?: number;
+  function applyPredictionChunk(args: {
+    predictionArgmax: ArrayLike<number> | null | undefined;
+    predictionConfidence?: ArrayLike<number> | null | undefined;
+    predictionOffset?: number;
   }) {
-    const visibleArgmax = args.visibleArgmax;
-    const visibleConfidence = args.visibleConfidence;
-    if (!visibleArgmax) return;
+    const predictionArgmax = args.predictionArgmax;
+    const predictionConfidence = args.predictionConfidence;
+    if (!predictionArgmax) return;
 
-    const start = Math.max(0, Math.floor(Number.isFinite(args.visibleOffset as number) ? Number(args.visibleOffset) : 0));
-    const maxCopy = Math.min(state.spectrumW - start, Number(visibleArgmax.length) || 0);
+    const start = Math.max(0, Math.floor(Number.isFinite(args.predictionOffset as number) ? Number(args.predictionOffset) : 0));
+    const maxCopy = Math.min(state.spectrumW - start, Number(predictionArgmax.length) || 0);
     for (let i = 0; i < maxCopy; i += 1) {
-      const value = Number(visibleArgmax[i]);
-      state.progressiveArgmax[start + i] = Number.isFinite(value) ? value : NaN;
+      const value = Number(predictionArgmax[i]);
+      state.predictionArgmax[start + i] = Number.isFinite(value) ? value : NaN;
     }
-    if (visibleConfidence) {
-      const confCopy = Math.min(state.spectrumW - start, Number(visibleConfidence.length) || 0);
+    if (predictionConfidence) {
+      const confCopy = Math.min(state.spectrumW - start, Number(predictionConfidence.length) || 0);
       for (let i = 0; i < confCopy; i += 1) {
-        state.progressiveConfidence[start + i] = Number(visibleConfidence[i] ?? 0);
+        state.predictionConfidence[start + i] = Number(predictionConfidence[i] ?? 0);
       }
     }
     state.renderedFrames = Math.max(state.renderedFrames, start + maxCopy);
-    if (Number.isFinite(args.totalExpectedFrames || 0) && Number(args.totalExpectedFrames || 0) > totalFrames) {
-      ensureBase(Number(args.totalExpectedFrames || 0), pendingDurationSec, true, true);
-    }
     requestRedraw();
   }
 
@@ -343,16 +338,16 @@ export function createProgressiveSpectrumVisualizer(
       );
     } else {
       spectrumData = EMPTY_FLOAT32;
-      progressiveArgmax = EMPTY_FLOAT32;
-      progressiveConfidence = EMPTY_FLOAT32;
+      predictionArgmax = EMPTY_FLOAT32;
+      predictionConfidence = EMPTY_FLOAT32;
       totalFrames = 0;
       height = Math.max(1, Math.floor(next.expectedFrames || height || DEFAULT_HEIGHT));
       syncState({
         spectrumData,
         spectrumW: 0,
         spectrumH: height,
-        progressiveArgmax,
-        progressiveConfidence,
+        predictionArgmax,
+        predictionConfidence,
       });
     }
   }
@@ -366,7 +361,7 @@ export function createProgressiveSpectrumVisualizer(
     reset,
     ensureBase,
     enqueueChunk,
-    applyInferenceProgress,
+    applyPredictionChunk,
     flush: drainQueuedChunks,
     setFrameSec(nextFrameSec: number) {
       if (Number.isFinite(nextFrameSec) && nextFrameSec > 0) {

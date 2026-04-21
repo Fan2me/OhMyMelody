@@ -48,7 +48,7 @@ type AnalyzerInferenceManagerLike = Pick<
   InferenceManager,
   "process" | "reset"
 > & {
-  hasCache?: (fileKey: string, modelName: string, expectedBatchCount?: number) => Promise<boolean>;
+  hasCache?: (fileKey: string, modelName: string) => Promise<boolean>;
 };
 
 export interface CreateAnalyzerOptions {
@@ -298,13 +298,13 @@ export function createAnalyzer(
       case AnalysisPhase.INFERENCE:
         {
           const payload = data as AnalyzerInferenceEventData;
-          summary = `phase=${phase} index=${index} cfp batches=${payload.cfp.length} inferenceFrames=${payload.inference.totalExpectedFrames}`;
+          summary = `phase=${phase} index=${index} cfp batches=${payload.cfp.length}`;
         }
         break;
       case AnalysisPhase.OUTPUT:
         {
           const payload = data as AnalyzerOutputEventData;
-          summary = `phase=${phase} index=${index} audio pcm=${payload.audio.pcm.length} fs=${payload.audio.fs} cfp batches=${payload.cfp.length} inferenceFrames=${payload.inference?.totalExpectedFrames ?? 0}`;
+          summary = `phase=${phase} index=${index} audio pcm=${payload.audio.pcm.length} fs=${payload.audio.fs} cfp batches=${payload.cfp.length}`;
         }
         break;
     }
@@ -475,9 +475,7 @@ export function createAnalyzer(
         }
         setPhase(AnalysisPhase.INFERENCE);
         const fileKey = String(input.fileKey || input.source.label || "").trim();
-        analyzerLogger.info(
-          `runtime analyzer inference start: model=${input.model.name} batches=${cfpResult.batches.length}`,
-        );
+        analyzerLogger.info(`runtime analyzer inference start: model=${input.model.name}`);
         const completeRun = isLastStep || cfpResult.complete;
         let inferenceCacheHit = false;
         const shouldProbeInferenceCache =
@@ -490,7 +488,7 @@ export function createAnalyzer(
 
         if (shouldProbeInferenceCache) {
           try {
-            inferenceCacheHit = await inferenceManager.hasCache!(fileKey, input.model.name, cfpResult.batches.length);
+            inferenceCacheHit = await inferenceManager.hasCache!(fileKey, input.model.name);
           } catch {
             inferenceCacheHit = false;
           }
@@ -502,9 +500,7 @@ export function createAnalyzer(
           !inferenceCacheHit;
 
         if (shouldProgressiveReplay) {
-          analyzerLogger.info(
-            `runtime analyzer inference progressive replay: model=${input.model.name} batches=${cfpResult.batches.length}`,
-          );
+          analyzerLogger.info(`runtime analyzer inference progressive replay: model=${input.model.name}`);
           for (let batchIndex = 0; batchIndex < cfpResult.batches.length; batchIndex += 1) {
             if (generation !== analysisGeneration) {
               return;
@@ -532,9 +528,7 @@ export function createAnalyzer(
               inference: inferenceResult,
             });
           }
-          analyzerLogger.info(
-            `runtime analyzer inference progressive replay done: model=${input.model.name} batches=${cfpResult.batches.length}`,
-          );
+          analyzerLogger.info(`runtime analyzer inference progressive replay done: model=${input.model.name}`);
         } else {
           const inferenceResult = await inferenceManager.process({
             batches: cfpResult.batches,
@@ -548,9 +542,7 @@ export function createAnalyzer(
             return;
           }
           lastInferenceResult = inferenceResult;
-          analyzerLogger.info(
-            `runtime analyzer inference done: model=${input.model.name} batches=${inferenceResult.totalBatchCount}`,
-          );
+          analyzerLogger.info(`runtime analyzer inference done: model=${input.model.name}`);
           emitPhaseEnd(AnalysisPhase.INFERENCE, stepIndex, {
             cfp: cfpResult.batches,
             allCfp: currentCFPBatches,

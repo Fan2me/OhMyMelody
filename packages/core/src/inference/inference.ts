@@ -117,13 +117,13 @@ export function computeArgmaxIndices(
   return result;
 }
 
-export function collectVisibleArgmax(
+export function collectBatchArgmax(
   batchArgmax: Int32Array | number[],
   chunk: readonly SegmentLike[],
   B: number,
   T: number,
 ): number[] {
-  const visible: number[] = [];
+  const batch: number[] = [];
   for (let b = 0; b < B && b < chunk.length; b += 1) {
     const current = chunk[b];
     if (!current) {
@@ -133,10 +133,10 @@ export function collectVisibleArgmax(
     for (let t = 0; t < keepT; t += 1) {
       const raw = Number(batchArgmax[b * T + t] ?? 0);
       const normalized = Number.isFinite(raw) ? Math.floor(raw) - 1 : -1;
-      visible.push(normalized);
+      batch.push(normalized);
     }
   }
-  return visible;
+  return batch;
 }
 
 export function marginToConfidence(best: number, secondBest: number): number {
@@ -153,14 +153,14 @@ export function marginToConfidence(best: number, secondBest: number): number {
   return 1 / (1 + Math.exp(-margin));
 }
 
-export function collectVisibleConfidenceFromScores(
+export function collectBatchConfidenceFromScores(
   scoreData: Float32Array,
   chunk: readonly SegmentLike[],
   B: number,
   F: number,
   T: number,
 ): number[] {
-  const visible: number[] = [];
+  const batch: number[] = [];
   for (let b = 0; b < B && b < chunk.length; b += 1) {
     const current = chunk[b];
     if (!current) {
@@ -180,10 +180,10 @@ export function collectVisibleConfidenceFromScores(
           second = v;
         }
       }
-      visible.push(marginToConfidence(best, second));
+      batch.push(marginToConfidence(best, second));
     }
   }
-  return visible;
+  return batch;
 }
 
 function now(): number {
@@ -271,8 +271,8 @@ export async function collectBatchPredictions({
   const outData = outTensor.data;
 
   return {
-    batchArgmax: collectVisibleArgmax(computeArgmaxIndices(outData, B, F, T), chunk, B, T),
-    batchConfidence: collectVisibleConfidenceFromScores(outData, chunk, B, F, T),
+    batchArgmax: collectBatchArgmax(computeArgmaxIndices(outData, B, F, T), chunk, B, T),
+    batchConfidence: collectBatchConfidenceFromScores(outData, chunk, B, F, T),
   };
 }
 

@@ -109,8 +109,8 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
   let analysisToken = 0;
   let timeline = buildSpectrumTimeline([]);
   let cfpBatches: readonly CFPBatch[] = [];
-  let predictionWriteOffset = 0;
-  let predictionVisibleCount = 0;
+  let predictionOffset = 0;
+  let predictionChunkCount = 0;
   let scheduledStepIndex = -1;
   let finished = false;
   let analysisDoneResolve: (() => void) | null = null;
@@ -141,26 +141,26 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
   }
 
   function writePredictionChunk(
-    visibleArgmax: readonly number[],
-    visibleConfidence: readonly number[] | Float32Array | null | undefined,
+    predictionArgmax: readonly number[],
+    predictionConfidence: readonly number[] | Float32Array | null | undefined,
   ): void {
     if (!progressiveVisualizer) {
       return;
     }
-    const nextVisibleCount = Math.max(0, Math.floor(visibleArgmax.length || 0));
-    const nextOffset = predictionWriteOffset;
-    const startIndex = Math.max(0, Math.min(predictionVisibleCount, nextVisibleCount));
-    const nextArgmax = visibleArgmax.slice(startIndex);
-    const nextConfidence = visibleConfidence
-      ? Array.prototype.slice.call(visibleConfidence, startIndex)
+    const nextChunkCount = Math.max(0, Math.floor(predictionArgmax.length || 0));
+    const nextOffset = predictionOffset;
+    const startIndex = Math.max(0, Math.min(predictionChunkCount, nextChunkCount));
+    const nextArgmax = predictionArgmax.slice(startIndex);
+    const nextConfidence = predictionConfidence
+      ? Array.prototype.slice.call(predictionConfidence, startIndex)
       : null;
-    progressiveVisualizer.applyInferenceProgress({
-      visibleArgmax: nextArgmax,
-      visibleConfidence: nextConfidence,
-      visibleOffset: nextOffset,
+    progressiveVisualizer.applyPredictionChunk({
+      predictionArgmax: nextArgmax,
+      predictionConfidence: nextConfidence,
+      predictionOffset: nextOffset,
     });
-    predictionWriteOffset = nextOffset + nextArgmax.length;
-    predictionVisibleCount = nextVisibleCount;
+    predictionOffset = nextOffset + nextArgmax.length;
+    predictionChunkCount = nextChunkCount;
   }
 
   function scheduleNextStep(nextIndex: number, token: number): void {
@@ -190,8 +190,8 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     getState: () => state,
     getInteractionState: () => interactionState,
     getAudioElement: () => audioElement,
-    getPredictionFrames: () => progressiveVisualizer?.state.progressiveArgmax ?? [],
-    getPredictionConfidence: () => progressiveVisualizer?.state.progressiveConfidence ?? null,
+    getPredictionFrames: () => progressiveVisualizer?.state.predictionArgmax ?? [],
+    getPredictionConfidence: () => progressiveVisualizer?.state.predictionConfidence ?? null,
   });
 
   const overviewOverlayRenderer = createSpectrumOverviewOverlayRenderer({
@@ -392,8 +392,8 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
           );
           rebuildTimelineFromBatches();
         }
-        predictionWriteOffset = 0;
-        predictionVisibleCount = 0;
+        predictionOffset = 0;
+        predictionChunkCount = 0;
         interactionState.spectrumW = Math.max(
           1,
           Math.round((event.data.audio.pcm.length / Math.max(1, event.data.audio.fs)) / FRAME_SEC),
@@ -448,13 +448,11 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
       }
       if (event.phase === AnalysisPhase.INFERENCE) {
         writePredictionChunk(
-          event.data.inference.visibleArgmax,
-          event.data.inference.visibleConfidence,
+          event.data.inference.totalArgmax,
+          event.data.inference.totalConfidence,
         );
         emit({ cfp: cfpBatches, inference: event.data.inference }, DIRTY.MAIN_OVERLAY);
-        uiLogger.info(
-          `inference phase-end: index=${event.index} visible=${event.data.inference?.visibleArgmax.length || 0}`,
-        );
+        uiLogger.info(`inference phase-end: index=${event.index} prediction=${event.data.inference?.totalArgmax.length || 0}`);
         return;
       }
       if (event.phase === AnalysisPhase.OUTPUT) {
@@ -466,9 +464,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
           cfp: cfpBatches,
           inference: event.data.inference,
         }, DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_BASE);
-        uiLogger.info(
-          `output phase-end: index=${event.index} audio=${event.data.audio.pcm.length} cfp=${event.data.cfp.length} inference=${event.data.inference?.visibleArgmax.length || 0}`,
-        );
+        uiLogger.info(`output phase-end: index=${event.index} audio=${event.data.audio.pcm.length} cfp=${event.data.cfp.length} prediction=${event.data.inference?.totalArgmax.length || 0}`);
         finished = true;
         analysisDoneResolve?.();
         analysisDoneResolve = null;
@@ -629,7 +625,6 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
       1,
       interactionState.spectrumW ||
         progressiveVisualizer?.state.spectrumW ||
-        state.inference?.visibleArgmax.length ||
         state.inference?.totalArgmax.length ||
         Math.round(durationSec / FRAME_SEC),
     );
@@ -660,7 +655,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     const hoverFrameX = hoverFrame >= 0
       ? ((hoverFrame - offsetFrames) / Math.max(1, viewFrames)) * canvasW
       : null;
-    const predictionFrames = progressiveVisualizer?.state.progressiveArgmax;
+    const predictionFrames = progressiveVisualizer?.state.predictionArgmax;
     const hoverFrameBinRaw =
       hoverFrame >= 0 && predictionFrames && hoverFrame < predictionFrames.length
         ? Number(predictionFrames[hoverFrame])
@@ -694,9 +689,8 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
         displayMaxBin,
       },
       prediction: {
-        frameCount: progressiveVisualizer?.state.progressiveArgmax.length || 0,
-        confidenceCount: progressiveVisualizer?.state.progressiveConfidence.length || 0,
-        inferenceVisibleCount: state.inference?.visibleArgmax.length || 0,
+        frameCount: progressiveVisualizer?.state.predictionArgmax.length || 0,
+        confidenceCount: progressiveVisualizer?.state.predictionConfidence.length || 0,
         inferenceTotalCount: state.inference?.totalArgmax.length || 0,
       },
       hover: {

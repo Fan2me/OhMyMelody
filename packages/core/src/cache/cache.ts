@@ -8,12 +8,7 @@ export interface CFPBatch {
 
 export interface PredictionCacheEntry {
   totalArgmax: Int32Array;
-  visibleArgmax: Int32Array;
   totalConfidence: Float32Array;
-  visibleConfidence: Float32Array;
-  totalExpectedFrames?: number;
-  totalBatchCount?: number;
-  complete?: boolean;
 }
 
 export interface IndexedDBStoreOptions {
@@ -343,48 +338,22 @@ export function normalizePredictionCacheEntry(
 
   const typed = entry as {
     totalArgmax?: unknown;
-    visibleArgmax?: unknown;
     totalConfidence?: unknown;
-    visibleConfidence?: unknown;
-    totalExpectedFrames?: unknown;
-    totalBatchCount?: unknown;
-    complete?: unknown;
   };
 
   const totalArgmax =
     typed.totalArgmax instanceof Int32Array
       ? typed.totalArgmax
       : Int32Array.from(Array.isArray(typed.totalArgmax) ? typed.totalArgmax : []);
-  const visibleArgmax =
-    typed.visibleArgmax instanceof Int32Array
-      ? typed.visibleArgmax
-      : Int32Array.from(Array.isArray(typed.visibleArgmax) ? typed.visibleArgmax : []);
   const totalConfidence =
     typed.totalConfidence instanceof Float32Array
       ? typed.totalConfidence
       : Float32Array.from(Array.isArray(typed.totalConfidence) ? typed.totalConfidence : []);
-  const visibleConfidence =
-    typed.visibleConfidence instanceof Float32Array
-      ? typed.visibleConfidence
-      : Float32Array.from(Array.isArray(typed.visibleConfidence) ? typed.visibleConfidence : []);
-  const totalExpectedFrames = Number(typed.totalExpectedFrames);
-  const totalBatchCount = Number(typed.totalBatchCount);
-  const complete = typed.complete === true;
 
   const normalized: PredictionCacheEntry = {
     totalArgmax,
-    visibleArgmax,
     totalConfidence,
-    visibleConfidence,
-    complete,
   };
-
-  if (Number.isFinite(totalExpectedFrames) && totalExpectedFrames > 0) {
-    normalized.totalExpectedFrames = Math.floor(totalExpectedFrames);
-  }
-  if (Number.isFinite(totalBatchCount) && totalBatchCount > 0) {
-    normalized.totalBatchCount = Math.floor(totalBatchCount);
-  }
 
   return normalized;
 }

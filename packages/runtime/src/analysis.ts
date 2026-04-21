@@ -16,20 +16,12 @@ export interface InferenceProgress {
   batchIdx: number;
   totalArgmax: number[];
   totalConfidence: number[];
-  visibleArgmax: number[];
-  visibleConfidence: number[];
-  visibleOffset: number;
-  totalExpectedFrames: number;
   done: boolean;
 }
 
 export interface InferenceResult {
   totalArgmax: number[];
   totalConfidence: number[];
-  visibleArgmax: number[];
-  visibleConfidence: number[];
-  totalExpectedFrames: number;
-  totalBatchCount: number;
 }
 
 export interface AnalysisPlanTask {

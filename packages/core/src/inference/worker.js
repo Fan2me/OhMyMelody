@@ -51,10 +51,6 @@ function buildEmptyInferenceResult() {
   return {
     totalArgmax: [],
     totalConfidence: [],
-    visibleArgmax: [],
-    visibleConfidence: [],
-    totalExpectedFrames: 0,
-    totalBatchCount: 0,
   };
 }
 
@@ -191,8 +187,8 @@ function computeArgmaxIndices(data, B, F, T) {
   return result;
 }
 
-function collectVisibleArgmax(batchArgmax, chunk, B, T) {
-  const visible = [];
+function collectBatchArgmax(batchArgmax, chunk, B, T) {
+  const batch = [];
   for (let b = 0; b < B && b < chunk.length; b += 1) {
     const current = chunk[b];
     if (!current) {
@@ -201,10 +197,10 @@ function collectVisibleArgmax(batchArgmax, chunk, B, T) {
     const keepT = Math.max(0, Math.floor(Number(current.validT) || 0));
     for (let t = 0; t < keepT; t += 1) {
       const raw = Number(batchArgmax[b * T + t] ?? 0);
-      visible.push(Number.isFinite(raw) ? Math.floor(raw) - 1 : -1);
+      batch.push(Number.isFinite(raw) ? Math.floor(raw) - 1 : -1);
     }
   }
-  return visible;
+  return batch;
 }
 
 function marginToConfidence(best, secondBest) {
@@ -221,8 +217,8 @@ function marginToConfidence(best, secondBest) {
   return 1 / (1 + Math.exp(-margin));
 }
 
-function collectVisibleConfidenceFromScores(scoreData, chunk, B, F, T) {
-  const visible = [];
+function collectBatchConfidenceFromScores(scoreData, chunk, B, F, T) {
+  const batch = [];
   for (let b = 0; b < B && b < chunk.length; b += 1) {
     const current = chunk[b];
     if (!current) {
@@ -242,10 +238,10 @@ function collectVisibleConfidenceFromScores(scoreData, chunk, B, F, T) {
           second = value;
         }
       }
-      visible.push(marginToConfidence(best, second));
+      batch.push(marginToConfidence(best, second));
     }
   }
-  return visible;
+  return batch;
 }
 
 function collectBatchPredictions(outTensor, chunk) {
@@ -255,13 +251,13 @@ function collectBatchPredictions(outTensor, chunk) {
   const outData = outTensor.data;
 
   return {
-    batchArgmax: collectVisibleArgmax(
+    batchArgmax: collectBatchArgmax(
       computeArgmaxIndices(outData, B, F, T),
       chunk,
       B,
       T,
     ),
-    batchConfidence: collectVisibleConfidenceFromScores(
+    batchConfidence: collectBatchConfidenceFromScores(
       outData,
       chunk,
       B,
@@ -317,16 +313,11 @@ function createResultFromSegments(inputName, batches) {
 
   const totalArgmax = [];
   const totalConfidence = [];
-  let totalExpectedFrames = 0;
-  let totalBatchCount = 0;
   const resolvedInputName =
     resolveSessionInputName(session) || inputName || "input";
 
   return (async () => {
     for (const batch of batches) {
-      const batchShape = batch && batch.shape ? Array.from(batch.shape) : [];
-      const batchFrames = Math.max(0, Math.floor(Number(batchShape[2]) || 0));
-      totalExpectedFrames += batchFrames;
       const segments = segmentBatchTo128(batch);
       for (const segment of segments) {
         const feeds = {
@@ -351,17 +342,12 @@ function createResultFromSegments(inputName, batches) {
         );
         totalArgmax.push(...batchArgmax);
         totalConfidence.push(...batchConfidence);
-        totalBatchCount += 1;
       }
     }
 
     return {
       totalArgmax,
       totalConfidence,
-      visibleArgmax: totalArgmax.slice(),
-      visibleConfidence: totalConfidence.slice(),
-      totalExpectedFrames,
-      totalBatchCount,
     };
   })();
 }
@@ -528,9 +514,7 @@ self.onmessage = async (ev) => {
         );
         const result = await createResultFromSegments(inputName, batches);
         currentResult = result;
-        logInfo(
-          `worker process done: id=${id} model=${currentModelName || "unknown"} batches=${result.totalBatchCount} totalFrames=${result.totalExpectedFrames}`,
-        );
+        logInfo(`worker process done: id=${id} model=${currentModelName || "unknown"}`);
         self.postMessage({ cmd: "result", id, result });
         return;
       }
@@ -570,10 +554,6 @@ self.onmessage = async (ev) => {
       const result = {
         totalArgmax: batchArgmax.slice(),
         totalConfidence: batchConfidence.slice(),
-        visibleArgmax: batchArgmax.slice(),
-        visibleConfidence: batchConfidence.slice(),
-        totalExpectedFrames: validT,
-        totalBatchCount: 1,
       };
       currentResult = result;
       self.postMessage({ cmd: "result", id, result });

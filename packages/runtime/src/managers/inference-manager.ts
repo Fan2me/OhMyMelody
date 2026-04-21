@@ -70,10 +70,6 @@ function buildEmptyInferenceResult(): InferenceResult {
   return {
     totalArgmax: [],
     totalConfidence: [],
-    visibleArgmax: [],
-    visibleConfidence: [],
-    totalExpectedFrames: 0,
-    totalBatchCount: 0,
   };
 }
 
@@ -84,14 +80,6 @@ function mergeInferenceResults(
   return {
     totalArgmax: [...(previous.totalArgmax || []), ...(next.totalArgmax || [])],
     totalConfidence: [...(previous.totalConfidence || []), ...(next.totalConfidence || [])],
-    visibleArgmax: [...(previous.visibleArgmax || []), ...(next.visibleArgmax || [])],
-    visibleConfidence: [...(previous.visibleConfidence || []), ...(next.visibleConfidence || [])],
-    totalExpectedFrames:
-      Math.max(0, Math.floor(Number(previous.totalExpectedFrames) || 0)) +
-      Math.max(0, Math.floor(Number(next.totalExpectedFrames) || 0)),
-    totalBatchCount:
-      Math.max(0, Math.floor(Number(previous.totalBatchCount) || 0)) +
-      Math.max(0, Math.floor(Number(next.totalBatchCount) || 0)),
   };
 }
 
@@ -130,53 +118,27 @@ export class InferenceManager {
     return buildPredictionCacheKey({
       fileKey,
       modelName: normalizeCoreModelName(modelName),
-      backend: "runtime-inference-v1",
+      backend: "runtime-inference-v2",
     });
   }
 
-  private toInferenceResultFromCache(entry: PredictionCacheEntry, totalBatchCount: number): InferenceResult {
+  private toInferenceResultFromCache(entry: PredictionCacheEntry): InferenceResult {
     const totalArgmax = Array.from(entry.totalArgmax || []);
     const totalConfidence = Array.from(entry.totalConfidence || []);
-    const visibleArgmax = Array.from(entry.visibleArgmax || []);
-    const visibleConfidence = Array.from(entry.visibleConfidence || []);
     return {
       totalArgmax,
       totalConfidence,
-      visibleArgmax,
-      visibleConfidence,
-      totalExpectedFrames:
-        Number.isFinite(Number(entry.totalExpectedFrames)) && Number(entry.totalExpectedFrames) > 0
-          ? Math.floor(Number(entry.totalExpectedFrames))
-          : Math.max(totalArgmax.length, visibleArgmax.length),
-      totalBatchCount:
-        Number.isFinite(Number(entry.totalBatchCount)) && Number(entry.totalBatchCount) > 0
-          ? Math.floor(Number(entry.totalBatchCount))
-          : totalBatchCount,
     };
   }
 
-  private isCacheEntryUsable(entry: PredictionCacheEntry, expectedBatchCount = 0): boolean {
-    if (!entry || entry.complete !== true) {
+  private isCacheEntryUsable(entry: PredictionCacheEntry): boolean {
+    if (!entry) {
       return false;
     }
-    const totalFrames =
-      Number.isFinite(Number(entry.totalExpectedFrames)) && Number(entry.totalExpectedFrames) > 0
-        ? Math.floor(Number(entry.totalExpectedFrames))
-        : Math.max(entry.totalArgmax.length, entry.visibleArgmax.length);
-    const batchCount =
-      Number.isFinite(Number(entry.totalBatchCount)) && Number(entry.totalBatchCount) > 0
-        ? Math.floor(Number(entry.totalBatchCount))
-        : 0;
-    if (totalFrames <= 0) {
+    if (entry.totalArgmax.length <= 0) {
       return false;
     }
     if (entry.totalConfidence.length < entry.totalArgmax.length) {
-      return false;
-    }
-    if (entry.visibleConfidence.length < entry.visibleArgmax.length) {
-      return false;
-    }
-    if (expectedBatchCount > 0 && batchCount > 0 && batchCount < expectedBatchCount) {
       return false;
     }
     return true;
@@ -185,16 +147,11 @@ export class InferenceManager {
   private toPredictionCacheEntry(result: InferenceResult): PredictionCacheEntry {
     return {
       totalArgmax: Int32Array.from(Array.isArray(result.totalArgmax) ? result.totalArgmax : []),
-      visibleArgmax: Int32Array.from(Array.isArray(result.visibleArgmax) ? result.visibleArgmax : []),
       totalConfidence: Float32Array.from(Array.isArray(result.totalConfidence) ? result.totalConfidence : []),
-      visibleConfidence: Float32Array.from(Array.isArray(result.visibleConfidence) ? result.visibleConfidence : []),
-      totalExpectedFrames: Math.max(0, Math.floor(Number(result.totalExpectedFrames) || 0)),
-      totalBatchCount: Math.max(0, Math.floor(Number(result.totalBatchCount) || 0)),
-      complete: true,
     };
   }
 
-  async hasCache(fileKey: string, modelName: string, expectedBatchCount = 0): Promise<boolean> {
+  async hasCache(fileKey: string, modelName: string): Promise<boolean> {
     const safeFileKey = String(fileKey || "").trim();
     if (!safeFileKey) {
       return false;
@@ -203,7 +160,7 @@ export class InferenceManager {
     try {
       const cachedRaw = await this.cache.getPredictionCache(cacheKey);
       const cached = normalizePredictionCacheEntry(cachedRaw);
-      return !!cached && this.isCacheEntryUsable(cached, expectedBatchCount);
+      return !!cached && this.isCacheEntryUsable(cached);
     } catch {
       return false;
     }
@@ -433,26 +390,22 @@ export class InferenceManager {
         typeof fileKey === "string" &&
         fileKey.trim().length > 0;
       const cacheKey = canUseCache ? this.buildInferenceCacheKey(String(fileKey), safeModelName) : "";
-      if (this.useCachedResult && this.result.totalExpectedFrames > 0) {
+      if (this.useCachedResult && this.result.totalArgmax.length > 0) {
         return this.result;
       }
-      if (canUseCache && cacheKey && forceRefresh !== true && this.result.totalExpectedFrames <= 0) {
+      if (canUseCache && cacheKey && forceRefresh !== true && this.result.totalArgmax.length <= 0) {
         try {
           const cachedRaw = await this.cache.getPredictionCache(cacheKey);
           const cached = normalizePredictionCacheEntry(cachedRaw);
-          if (cached && this.isCacheEntryUsable(cached, batches.length)) {
-            const hit = this.toInferenceResultFromCache(cached, batches.length);
+          if (cached && this.isCacheEntryUsable(cached)) {
+            const hit = this.toInferenceResultFromCache(cached);
             this.result = hit;
             this.useCachedResult = true;
-            inferenceLogger.info(
-              `runtime inference cache hit: key=${cacheKey} totalFrames=${hit.totalExpectedFrames}`,
-            );
+            inferenceLogger.info(`runtime inference cache hit: key=${cacheKey}`);
             return hit;
           }
-          if (cached && !this.isCacheEntryUsable(cached, batches.length)) {
-            inferenceLogger.warn(
-              `runtime inference cache ignored: key=${cacheKey} reason=incomplete-or-mismatch`,
-            );
+          if (cached && !this.isCacheEntryUsable(cached)) {
+            inferenceLogger.warn(`runtime inference cache ignored: key=${cacheKey} reason=invalid-cache-entry`);
           }
         } catch (error) {
           inferenceLogger.warn(
@@ -488,9 +441,7 @@ export class InferenceManager {
       if (canUseCache && cacheKey && complete === true) {
         try {
           await this.cache.setPredictionCache(cacheKey, this.toPredictionCacheEntry(mergedResult));
-          inferenceLogger.info(
-            `runtime inference cache written: key=${cacheKey} totalFrames=${mergedResult.totalExpectedFrames}`,
-          );
+          inferenceLogger.info(`runtime inference cache written: key=${cacheKey}`);
         } catch (error) {
           inferenceLogger.warn(
             `runtime inference cache write failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -498,7 +449,7 @@ export class InferenceManager {
         }
       }
       inferenceLogger.info(
-        `runtime inference worker process done: session=${this.sessionId} id=${id} model=${safeModelName} provider=${this.currentProvider || "unknown"} batches=${mergedResult.totalBatchCount} totalFrames=${mergedResult.totalExpectedFrames} visible=${mergedResult.visibleArgmax.length}`,
+        `runtime inference worker process done: session=${this.sessionId} id=${id} model=${safeModelName} provider=${this.currentProvider || "unknown"}`,
       );
       return mergedResult;
     });
