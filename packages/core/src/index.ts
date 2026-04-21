@@ -1,5 +1,5 @@
 export * from './abort/abort.js';
-export * from './audio/mono-session.js';
+export * from './audio/capture-session.js';
 export * from './audio/index.js';
 export * from './cache/cache.js';
 export * from './cfp/index.js';

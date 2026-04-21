@@ -1,4 +1,4 @@
-import { createCaptureSession, type CaptureSession } from '../audio/mono-session.js';
+import { createCaptureSession, type CaptureSession } from '../audio/capture-session.js';
 import {
   captureMediaSource,
   type MediaCaptureContextOptions,
