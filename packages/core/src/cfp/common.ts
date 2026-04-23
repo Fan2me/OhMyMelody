@@ -81,6 +81,8 @@ export function sortByStart<T extends { start?: number | null }>(
   );
 }
 
+export function toPositiveFinite(value: unknown, fallback: number): number;
+export function toPositiveFinite(value: unknown, fallback: null): null;
 export function toPositiveFinite(
   value: unknown,
   fallback: number | null,

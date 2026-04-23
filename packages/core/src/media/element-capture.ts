@@ -15,6 +15,7 @@ interface MediaElementCaptureState {
   session: CaptureSession | null;
   timeoutId: ReturnType<typeof setTimeout> | null;
   playbackStarted: boolean;
+  onChunk: ((chunk: readonly Float32Array[], sampleRate: number) => void) | null;
 }
 
 type HTMLAudioElementWithPlaybackFlags = HTMLAudioElement & {
@@ -99,6 +100,7 @@ function resolveMediaElementCaptureEnvironment(
     session: null,
     timeoutId: null,
     playbackStarted: false,
+    onChunk: typeof options.onChunk === "function" ? options.onChunk : null,
   };
 }
 
@@ -159,6 +161,7 @@ async function startMediaElementCapturePlayback(
       state.session = await createCaptureSession(
         state.audioCtx,
         state.audioCtx.createMediaElementSource(state.audioEl),
+        state.onChunk,
       );
     }
     if (
@@ -232,7 +235,7 @@ function createMediaElementCaptureSource(
             }
             finish(
               null,
-              state.session.finalize(state.audioCtx.sampleRate || 44100),
+              state.session.finalize(state.audioCtx.sampleRate),
             );
           } catch (error) {
             finish(error instanceof Error ? error : new Error(String(error)));

@@ -281,6 +281,11 @@ const BROWSER_ORT_SCRIPT_URL =
 const BROWSER_ORT_WASM_PATH =
   "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/";
 
+export const CORE_INFERENCE_WORKER_MODULE_URL = new URL(
+  "./worker.js",
+  import.meta.url,
+).toString();
+
 let browserOrtRuntimePromise: Promise<BrowserORTNamespace> | null = null;
 
 function resolveBrowserOrtRuntime(): BrowserORTNamespace | null {

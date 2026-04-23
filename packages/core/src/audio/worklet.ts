@@ -13,7 +13,10 @@ export interface ChannelCaptureWorkletOptions {
 const CHANNEL_CAPTURE_WORKLET_NAME = 'ohm-channel-capture-processor';
 
 let channelCaptureWorkletModuleUrl: string | null = null;
-let channelCaptureWorkletModuleReady: Promise<void> | null = null;
+const channelCaptureWorkletModuleReadyByWorklet = new WeakMap<
+  AudioWorklet,
+  Promise<void>
+>();
 
 function buildChannelCaptureWorkletSource(): string {
   return `
@@ -81,13 +84,20 @@ async function ensureChannelCaptureWorkletModuleLoaded(audioCtx: AudioContext): 
     throw new Error('AudioWorklet is not supported in current environment');
   }
 
-  if (!channelCaptureWorkletModuleReady) {
-    channelCaptureWorkletModuleReady = audioCtx.audioWorklet
+  const worklet = audioCtx.audioWorklet;
+  let ready = channelCaptureWorkletModuleReadyByWorklet.get(worklet);
+  if (!ready) {
+    ready = worklet
       .addModule(getChannelCaptureWorkletModuleUrl())
-      .then(() => undefined);
+      .then(() => undefined)
+      .catch((error) => {
+        channelCaptureWorkletModuleReadyByWorklet.delete(worklet);
+        throw error;
+      });
+    channelCaptureWorkletModuleReadyByWorklet.set(worklet, ready);
   }
 
-  await channelCaptureWorkletModuleReady;
+  await ready;
 }
 
 export async function attachChannelCaptureWorklet({

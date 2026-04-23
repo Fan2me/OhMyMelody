@@ -15,11 +15,16 @@ export class CaptureSession implements ChannelPcmChunkSink {
 
   private sourceNode: AudioNode | null = null;
   private workletHandle: ChannelCaptureWorkletHandle | null = null;
+  private readonly onChunk: ((chunk: readonly Float32Array[], sampleRate: number) => void) | null;
 
-  public constructor(private readonly audioCtx: AudioContext) {
+  public constructor(
+    private readonly audioCtx: AudioContext,
+    onChunk: ((chunk: readonly Float32Array[], sampleRate: number) => void) | null = null,
+  ) {
     if (!audioCtx) {
       throw new Error('audio context is required');
     }
+    this.onChunk = typeof onChunk === 'function' ? onChunk : null;
   }
 
   public async attach(sourceNode: AudioNode): Promise<void> {
@@ -35,6 +40,7 @@ export class CaptureSession implements ChannelPcmChunkSink {
       audioCtx: this.audioCtx,
       sourceNode,
       onChunk: (chunk) => {
+        this.onChunk?.(chunk, this.audioCtx.sampleRate);
         appendChannelPcmChunkToSink(this, chunk);
       },
     });
@@ -49,7 +55,7 @@ export class CaptureSession implements ChannelPcmChunkSink {
       this.audioCtx,
       this.channelChunks,
       this.totalFrames,
-      Math.max(1, Math.floor(sampleRate || 44100)),
+      Math.max(1, Math.floor(sampleRate)),
     );
   }
 
@@ -71,8 +77,9 @@ export class CaptureSession implements ChannelPcmChunkSink {
 export async function createCaptureSession(
   audioCtx: AudioContext,
   sourceNode: AudioNode,
+  onChunk: ((chunk: readonly Float32Array[], sampleRate: number) => void) | null = null,
 ): Promise<CaptureSession> {
-  const session = new CaptureSession(audioCtx);
+  const session = new CaptureSession(audioCtx, onChunk);
   await session.attach(sourceNode);
   return session;
 }

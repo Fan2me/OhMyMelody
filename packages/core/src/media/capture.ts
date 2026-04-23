@@ -7,6 +7,7 @@ import {
 export interface MediaCaptureContextOptions {
   audioContext?: AudioContext | null;
   signal?: AbortSignal | null;
+  onChunk?: ((chunk: readonly Float32Array[], sampleRate: number) => void) | null;
 }
 
 export interface MediaElementCaptureOptions extends MediaCaptureContextOptions {

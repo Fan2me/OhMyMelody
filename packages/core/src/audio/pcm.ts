@@ -9,15 +9,15 @@ export interface ChannelPcmChunkSink {
   totalFrames: number;
 }
 
-const TARGET_SAMPLE_RATE = 8000;
+export const DEFAULT_TARGET_SAMPLE_RATE = 8000;
 
 function resampleMonoPcm(
   pcm: Float32Array,
   sourceRate: number,
-  targetRate = TARGET_SAMPLE_RATE,
+  targetRate = DEFAULT_TARGET_SAMPLE_RATE,
 ): Float32Array {
   const srcRate = Math.max(1, Math.floor(sourceRate || 1));
-  const dstRate = Math.max(1, Math.floor(targetRate || TARGET_SAMPLE_RATE));
+  const dstRate = Math.max(1, Math.floor(targetRate || DEFAULT_TARGET_SAMPLE_RATE));
   if (!pcm.length) {
     return new Float32Array(0);
   }
@@ -41,19 +41,22 @@ function resampleMonoPcm(
   return dst;
 }
 
-function mixDownToMono(audioBuffer: AudioBuffer): Float32Array {
-  const channelCount = Math.max(1, audioBuffer.numberOfChannels || 1);
-  const length = audioBuffer.length || 0;
+export function mixDownChannelsToMono(channels: readonly Float32Array[]): Float32Array {
+  const channelCount = Math.max(1, channels.length || 1);
+  const length = channels[0]?.length || 0;
   const mono = new Float32Array(length);
 
-  if (channelCount === 1) {
-    mono.set(audioBuffer.getChannelData(0));
+  if (!length) {
     return mono;
   }
 
-  for (let ch = 0; ch < channelCount; ch += 1) {
-    const data =
-      audioBuffer.numberOfChannels > ch ? audioBuffer.getChannelData(ch) : null;
+  if (channelCount === 1 && channels[0]) {
+    mono.set(channels[0]);
+    return mono;
+  }
+
+  for (let ch = 0; ch < channels.length; ch += 1) {
+    const data = channels[ch];
     if (!data) {
       continue;
     }
@@ -64,6 +67,13 @@ function mixDownToMono(audioBuffer: AudioBuffer): Float32Array {
   }
 
   return mono;
+}
+
+function mixDownToMono(audioBuffer: AudioBuffer): Float32Array {
+  const channels = Array.from({ length: Math.max(1, audioBuffer.numberOfChannels || 1) }, (_, ch) =>
+    audioBuffer.getChannelData(ch),
+  );
+  return mixDownChannelsToMono(channels);
 }
 
 export function appendChannelPcmChunkToSink(
@@ -149,7 +159,7 @@ export function createAudioBufferFromChannelChunks(
   const buffer = audioCtx.createBuffer(
     channelCount,
     totalFrames,
-    Math.max(1, Math.floor(sampleRate || 44100)),
+    Math.max(1, Math.floor(sampleRate)),
   );
 
   for (let ch = 0; ch < channelCount; ch += 1) {
@@ -164,7 +174,7 @@ export function postProcessDecodedAudio({
   audioBuffer = null,
   decodedPcm = null,
   sampleRate = 0,
-  targetSampleRate = TARGET_SAMPLE_RATE,
+  targetSampleRate = DEFAULT_TARGET_SAMPLE_RATE,
 }: {
   audioBuffer?: AudioBuffer | null;
   decodedPcm?: Float32Array | null;
@@ -180,7 +190,7 @@ export function postProcessDecodedAudio({
     : sampleRate;
   return {
     pcm: resampleMonoPcm(pcm, srcRate, targetSampleRate),
-    fs: Math.max(1, Math.floor(targetSampleRate || TARGET_SAMPLE_RATE)),
+    fs: Math.max(1, Math.floor(targetSampleRate || DEFAULT_TARGET_SAMPLE_RATE)),
   };
 }
 

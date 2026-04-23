@@ -1,4 +1,4 @@
-import type { CFPBatch } from "../cache/cache.js";
+import type { CFPBatch } from "../cache/cfp.js";
 
 export interface CFPChunkInput {
   pcm: Float32Array;

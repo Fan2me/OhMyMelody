@@ -9,11 +9,18 @@ interface MediaStreamCaptureState {
   audioCtx: AudioContext;
   stream: MediaStream;
   session: CaptureSession | null;
+  onChunk: ((chunk: readonly Float32Array[], sampleRate: number) => void) | null;
+  finalizeTimer: ReturnType<typeof setTimeout> | null;
 }
 
 function cleanupMediaStreamCaptureResources(state: MediaStreamCaptureState | null): void {
   if (!state) {
     return;
+  }
+
+  if (state.finalizeTimer !== null) {
+    clearTimeout(state.finalizeTimer);
+    state.finalizeTimer = null;
   }
 
   try {
@@ -34,6 +41,7 @@ function isStreamActive(stream: MediaStream): boolean {
 function createMediaStreamCaptureSource(
   stream: MediaStream,
   audioCtx: AudioContext,
+  options: MediaCaptureContextOptions = {},
 ): MediaCaptureSource<AudioBuffer, MediaCaptureContextOptions> {
   if (!stream || typeof stream.getTracks !== 'function') {
     throw new Error('media stream is required');
@@ -43,6 +51,8 @@ function createMediaStreamCaptureSource(
     audioCtx,
     stream,
     session: null,
+    onChunk: typeof options.onChunk === 'function' ? options.onChunk : null,
+    finalizeTimer: null,
   };
 
   return {
@@ -57,7 +67,11 @@ function createMediaStreamCaptureSource(
           throw new Error('media stream has no tracks');
         }
 
-        state.session = await createCaptureSession(audioCtx, audioCtx.createMediaStreamSource(stream));
+        state.session = await createCaptureSession(
+          audioCtx,
+          audioCtx.createMediaStreamSource(stream),
+          state.onChunk,
+        );
 
         for (const track of tracks) {
           if (!track || track.readyState === 'ended') {
@@ -69,14 +83,23 @@ function createMediaStreamCaptureSource(
               if (isStreamActive(stream)) {
                 return;
               }
-              try {
-                if (!state.session) {
-                  throw new Error('capture session is unavailable');
-                }
-                finish(null, state.session.finalize(audioCtx.sampleRate || 44100));
-              } catch (error) {
-                finish(error instanceof Error ? error : new Error(String(error)));
+              if (state.finalizeTimer !== null) {
+                clearTimeout(state.finalizeTimer);
               }
+              state.finalizeTimer = setTimeout(() => {
+                state.finalizeTimer = null;
+                if (isStreamActive(stream)) {
+                  return;
+                }
+                try {
+                  if (!state.session) {
+                    throw new Error('capture session is unavailable');
+                  }
+                  finish(null, state.session.finalize(audioCtx.sampleRate));
+                } catch (error) {
+                  finish(error instanceof Error ? error : new Error(String(error)));
+                }
+              }, 80);
             },
             { once: true },
           );
@@ -100,7 +123,7 @@ export async function captureAudioFromMediaStream(
   options: MediaCaptureContextOptions = {},
 ): Promise<AudioBuffer> {
   return await captureMediaSource(
-    (audioCtx) => createMediaStreamCaptureSource(stream, audioCtx),
+    (audioCtx, captureOptions) => createMediaStreamCaptureSource(stream, audioCtx, captureOptions),
     options,
   );
 }
