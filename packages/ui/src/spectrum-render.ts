@@ -1,12 +1,10 @@
 import {
   benchmarkHeatmapTimelineRender,
-  buildSpectrumTimeline,
   renderHeatmapTimeline,
   type HeatmapBenchmarkEntry,
   type HeatmapFrequencyViewport,
   type HeatmapOptimizationLevel,
   type HeatmapTimeline,
-  type HeatmapTimelineSlot,
 } from "./heatmap-render-core.js";
 import {
   DEFAULT_MAIN_HEIGHT,
@@ -30,27 +28,6 @@ import type {
   SpectrumOverviewOverlayRenderer,
 } from "./spectrum-overview-overlay.js";
 
-type HeatmapRenderCommand =
-  | { cmd: "set-timeline"; cfp: readonly HeatmapTimelineSlot[]; seq: number }
-  | {
-      cmd: "render";
-      target: "main" | "overview";
-      width: number;
-      height: number;
-      viewport?: { startSlot: number; endSlot: number } | null;
-      viewportMode?: "slots" | "frames";
-      frequencyViewport?: HeatmapFrequencyViewport | null;
-      representativeMode?: string;
-      sampleStrideFrames?: number;
-      optimizationLevel?: HeatmapOptimizationLevel;
-      requestId: number;
-    };
-
-type HeatmapRenderResponse =
-  | { cmd: "ready"; seq: number }
-  | { cmd: "frame"; target: "main" | "overview"; requestId: number; bitmap: ImageBitmap }
-  | { cmd: "error"; target?: "main" | "overview"; requestId?: number; error: string };
-
 export interface SpectrumRenderControllerDeps {
   windowRef: Window | null;
   documentRef: Document | null;
@@ -58,8 +35,6 @@ export interface SpectrumRenderControllerDeps {
   getInteractionState: () => SpectrumInteractionState;
   mainOverlayRenderer: SpectrumMainOverlayRenderer;
   overviewOverlayRenderer: SpectrumOverviewOverlayRenderer;
-  heatmapWorkerFactory?: (() => Worker | null) | null;
-  heatmapWorkerUrl?: string | URL | null;
 }
 
 const FRAME_SEC = 0.01;
@@ -67,7 +42,7 @@ const FRAME_SEC = 0.01;
 export interface SpectrumRenderController {
   mount(nextMount: HTMLElement | null): void;
   attachAudioElement(nextAudioElement: HTMLAudioElement | null): void;
-  setTimeline(nextTimeline: readonly HeatmapTimelineSlot[] | null): void;
+  setTimeline(nextTimeline: HeatmapTimeline | null): void;
   requestSpectrumRedraw(next?: boolean | { force?: boolean; includeOverviewBase?: boolean; dirtyMask?: number }): void;
   requestOverviewOverlayRedraw(): void;
   runHeatmapBenchmark(rounds?: number): HeatmapBenchmarkEntry[];
@@ -114,8 +89,6 @@ export function createSpectrumRenderController(
     getInteractionState,
     mainOverlayRenderer,
     overviewOverlayRenderer,
-    heatmapWorkerFactory = null,
-    heatmapWorkerUrl = null,
   } = deps;
 
   let root: HTMLDivElement | null = null;
@@ -139,29 +112,8 @@ export function createSpectrumRenderController(
   let playing = false;
   let lastAutoPanAt = 0;
   let autoPanSuppressedUntil = 0;
-  let heatmapWorker: Worker | null = null;
-  let heatmapWorkerReady = false;
-  let heatmapRequestSeq = 0;
   let heatmapTimelineSeq = 0;
   let timeline: HeatmapTimeline | null = null;
-  let timelineSource: readonly HeatmapTimelineSlot[] | null = null;
-  const pendingHeatmapTargets = new Map<
-    number,
-    {
-      target: "main" | "overview";
-      canvas: HTMLCanvasElement;
-      ctx: CanvasRenderingContext2D | null;
-      signature: string;
-    }
-  >();
-  const latestHeatmapSignature: Record<"main" | "overview", string | null> = {
-    main: null,
-    overview: null,
-  };
-  const inFlightHeatmapSignature: Record<"main" | "overview", string | null> = {
-    main: null,
-    overview: null,
-  };
   const lastDrawAt = {
     mainBase: 0,
     mainOverlay: 0,
@@ -174,16 +126,19 @@ export function createSpectrumRenderController(
   const AUTO_PAN_SUPPRESS_MS = 250;
 
   function destroyHeatmapWorker(): void {
-    try {
-      heatmapWorker?.terminate();
-    } catch {}
-    heatmapWorker = null;
-    heatmapWorkerReady = false;
-    pendingHeatmapTargets.clear();
-    latestHeatmapSignature.main = null;
-    latestHeatmapSignature.overview = null;
-    inFlightHeatmapSignature.main = null;
-    inFlightHeatmapSignature.overview = null;
+    return;
+  }
+
+  function clearQueuedHeatmapRequests(): void {
+    return;
+  }
+
+  function attachHeatmapWorkerHandlers(nextWorker: Worker): Worker {
+    return nextWorker;
+  }
+
+  function flushQueuedHeatmapRequest(): void {
+    return;
   }
 
   function buildHeatmapRenderSignature(args: {
@@ -308,157 +263,70 @@ export function createSpectrumRenderController(
   }
 
   function ensureHeatmapWorker(): Worker | null {
-    if (!documentRef || typeof Worker === "undefined") {
-      return null;
-    }
-    if (heatmapWorker) {
-      return heatmapWorker;
-    }
-    try {
-      if (heatmapWorkerFactory) {
-        const nextWorker = heatmapWorkerFactory();
-        if (nextWorker) {
-          heatmapWorker = nextWorker;
-          return heatmapWorker;
-        }
-      }
-      const workerUrl = heatmapWorkerUrl
-        ? new URL(String(heatmapWorkerUrl), import.meta.url)
-        : new URL("./heatmap-render-worker.js?worker", import.meta.url);
-      const nextWorker = new Worker(workerUrl, { type: "module" });
-      nextWorker.onmessage = (event: MessageEvent<HeatmapRenderResponse>) => {
-        const message = event.data || ({} as HeatmapRenderResponse);
-        if (message.cmd === "ready") {
-          heatmapWorkerReady = true;
-          return;
-        }
-        if (message.cmd === "frame") {
-          const pending = pendingHeatmapTargets.get(Number(message.requestId));
-          if (!pending) {
-            try {
-              message.bitmap?.close?.();
-            } catch {}
-            return;
-          }
-          pendingHeatmapTargets.delete(Number(message.requestId));
-          inFlightHeatmapSignature[pending.target] = null;
-          latestHeatmapSignature[pending.target] = pending.signature;
-          try {
-            pending.ctx?.clearRect(0, 0, pending.canvas.width, pending.canvas.height);
-            pending.ctx?.drawImage(message.bitmap, 0, 0);
-          } finally {
-            try {
-              message.bitmap?.close?.();
-            } catch {}
-          }
-          if (pending.target === "main") {
-            lastDrawAt.mainBase = performance.now();
-          } else {
-            lastDrawAt.overviewBase = performance.now();
-          }
-          schedule(0);
-          return;
-        }
-        if (message.cmd === "error") {
-          if (message.target === "main" || message.target === "overview") {
-            inFlightHeatmapSignature[message.target] = null;
-          } else {
-            inFlightHeatmapSignature.main = null;
-            inFlightHeatmapSignature.overview = null;
-          }
-          console.warn(`ui heatmap worker error: ${message.error || "unknown"}`);
-        }
-      };
-      nextWorker.onerror = (error) => {
-        console.warn(`ui heatmap worker runtime error: ${String(error)}`);
-        destroyHeatmapWorker();
-      };
-      heatmapWorker = nextWorker;
-      return heatmapWorker;
-    } catch (error) {
-      console.warn(
-        `ui heatmap worker unavailable: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      return null;
-    }
+    return null;
   }
 
   function postHeatmapTimeline(): void {
-    const worker = ensureHeatmapWorker();
-    if (!worker || !timeline) {
-      return;
-    }
-    heatmapTimelineSeq += 1;
-    worker.postMessage({
-      cmd: "set-timeline",
-      cfp: timelineSource ?? [],
-      seq: heatmapTimelineSeq,
-    } satisfies HeatmapRenderCommand);
+    return;
   }
 
-  function requestHeatmapRender(
-    target: "main" | "overview",
-    canvas: HTMLCanvasElement | null,
-    ctx: CanvasRenderingContext2D | null,
-    viewport: { startSlot: number; endSlot: number } | null = null,
-    viewportMode: "slots" | "frames" = target === "main" ? "frames" : "slots",
-    representativeMode = "first-valid",
-    frequencyViewport: HeatmapFrequencyViewport | null = null,
-    sampleStrideFrames = 1,
-    optimizationLevel: HeatmapOptimizationLevel = "u32-region",
-  ): boolean {
-    const worker = heatmapWorkerReady ? heatmapWorker : null;
-    if (!canvas || !ctx || !timeline) {
-      return false;
-    }
-    const signature = buildHeatmapRenderSignature({
-      target,
-      width: canvas.width,
-      height: canvas.height,
-      viewport,
-      viewportMode,
-      representativeMode,
-      frequencyViewport,
-      sampleStrideFrames,
-      optimizationLevel,
-    });
-    if (latestHeatmapSignature[target] === signature) {
-      return true;
-    }
-    if (inFlightHeatmapSignature[target] === signature) {
-      return true;
-    }
-    if (!worker) {
-      return false;
-    }
-    const alreadyPending = Array.from(pendingHeatmapTargets.values()).some(
-      (item) => item.target === target,
+  function resolveSpectrumFrequencyViewport(
+    state: SpectrumUiState,
+  ): HeatmapFrequencyViewport {
+    const spectrumBinCount = Math.max(
+      1,
+      Math.floor(getInteractionState().spectrumH || timeline?.freqCount || 1),
     );
-    if (alreadyPending) {
-      return true;
+    const frequencyViewport: HeatmapFrequencyViewport = {
+      minBin: Math.max(
+        0,
+        Math.min(spectrumBinCount - 1, Math.floor(state.pitchRange.minBin || 0)),
+      ),
+      maxBin: Math.max(
+        0,
+        Math.min(
+          spectrumBinCount - 1,
+          Math.floor(state.pitchRange.maxBin || (spectrumBinCount - 1)),
+        ),
+      ),
+    };
+    if (frequencyViewport.maxBin < frequencyViewport.minBin) {
+      frequencyViewport.maxBin = frequencyViewport.minBin;
     }
-    const requestId = ++heatmapRequestSeq;
-    pendingHeatmapTargets.set(requestId, {
-      target,
-      canvas,
+    return frequencyViewport;
+  }
+
+  function renderBaseHeatmapTarget(args: {
+    target: "main" | "overview";
+    now: number;
+    state: SpectrumUiState;
+    canvas: HTMLCanvasElement | null;
+    ctx: CanvasRenderingContext2D | null;
+    viewport: { startSlot: number; endSlot: number };
+    representativeMode: string;
+    frequencyViewport: HeatmapFrequencyViewport;
+    sampleStrideFrames: number;
+  }): void {
+    const { target, now, canvas, ctx, viewport, representativeMode, frequencyViewport, sampleStrideFrames } = args;
+    if (!canvas || !ctx) {
+      return;
+    }
+    drawHeatmap(
       ctx,
-      signature,
-    });
-    inFlightHeatmapSignature[target] = signature;
-    worker.postMessage({
-      cmd: "render",
-      target,
-      width: canvas.width,
-      height: canvas.height,
+      canvas,
+      timeline,
       viewport,
-      viewportMode,
-      frequencyViewport,
+      "frames",
       representativeMode,
+      frequencyViewport,
       sampleStrideFrames,
-      optimizationLevel,
-      requestId,
-    } satisfies HeatmapRenderCommand);
-    return true;
+      "u32-region",
+    );
+    if (target === "main") {
+      lastDrawAt.mainBase = now;
+    } else {
+      lastDrawAt.overviewBase = now;
+    }
   }
 
   function schedule(
@@ -574,15 +442,7 @@ export function createSpectrumRenderController(
       mainBaseCtx
     ) {
       if (forceRender || mainFps <= 0 || now - lastDrawAt.mainBase >= 1000 / mainFps) {
-        const statePitchRange = state.pitchRange;
-        const spectrumBinCount = Math.max(1, Math.floor(getInteractionState().spectrumH || timeline?.freqCount || 1));
-        const frequencyViewport: HeatmapFrequencyViewport = {
-          minBin: Math.max(0, Math.min(spectrumBinCount - 1, Math.floor(statePitchRange.minBin || 0))),
-          maxBin: Math.max(0, Math.min(spectrumBinCount - 1, Math.floor(statePitchRange.maxBin || (spectrumBinCount - 1)))),
-        };
-        if (frequencyViewport.maxBin < frequencyViewport.minBin) {
-          frequencyViewport.maxBin = frequencyViewport.minBin;
-        }
+        const frequencyViewport = resolveSpectrumFrequencyViewport(state);
         const interactionState = getInteractionState();
         const mainViewW = getMainViewFrameCount(interactionState);
         const mainSampleStrideFrames = Math.max(
@@ -606,10 +466,17 @@ export function createSpectrumRenderController(
             ),
           ),
         };
-        if (!requestHeatmapRender("main", mainBase, mainBaseCtx, mainViewport, "frames", representativeMode, frequencyViewport, mainSampleStrideFrames, "u32-region")) {
-          drawHeatmap(mainBaseCtx, mainBase, timeline, mainViewport, "frames", representativeMode, frequencyViewport, mainSampleStrideFrames, "u32-region");
-          lastDrawAt.mainBase = now;
-        }
+        renderBaseHeatmapTarget({
+          target: "main",
+          now,
+          state,
+          canvas: mainBase,
+          ctx: mainBaseCtx,
+          viewport: mainViewport,
+          representativeMode,
+          frequencyViewport,
+          sampleStrideFrames: mainSampleStrideFrames,
+        });
       } else {
         dirtyMask |= DIRTY.MAIN_BASE;
       }
@@ -621,15 +488,7 @@ export function createSpectrumRenderController(
       overviewBaseCtx
     ) {
       if (forceRender || overviewFps <= 0 || now - lastDrawAt.overviewBase >= 1000 / overviewFps) {
-        const statePitchRange = state.pitchRange;
-        const spectrumBinCount = Math.max(1, Math.floor(getInteractionState().spectrumH || timeline?.freqCount || 1));
-        const frequencyViewport: HeatmapFrequencyViewport = {
-          minBin: Math.max(0, Math.min(spectrumBinCount - 1, Math.floor(statePitchRange.minBin || 0))),
-          maxBin: Math.max(0, Math.min(spectrumBinCount - 1, Math.floor(statePitchRange.maxBin || (spectrumBinCount - 1)))),
-        };
-        if (frequencyViewport.maxBin < frequencyViewport.minBin) {
-          frequencyViewport.maxBin = frequencyViewport.minBin;
-        }
+        const frequencyViewport = resolveSpectrumFrequencyViewport(state);
         const interactionState = getInteractionState();
         const overviewTotalFrames = Math.max(
           1,
@@ -639,10 +498,17 @@ export function createSpectrumRenderController(
           startSlot: 0,
           endSlot: overviewTotalFrames,
         };
-        if (!requestHeatmapRender("overview", overviewBase, overviewBaseCtx, overviewViewport, "frames", representativeMode, frequencyViewport, 1, "u32-region")) {
-          drawHeatmap(overviewBaseCtx, overviewBase, timeline, overviewViewport, "frames", representativeMode, frequencyViewport, 1, "u32-region");
-          lastDrawAt.overviewBase = now;
-        }
+        renderBaseHeatmapTarget({
+          target: "overview",
+          now,
+          state,
+          canvas: overviewBase,
+          ctx: overviewBaseCtx,
+          viewport: overviewViewport,
+          representativeMode,
+          frequencyViewport,
+          sampleStrideFrames: 1,
+        });
       } else {
         dirtyMask |= DIRTY.OVERVIEW_BASE;
       }
@@ -760,10 +626,8 @@ export function createSpectrumRenderController(
     schedule(undefined, true);
   }
 
-  function setTimeline(nextTimelineSource: readonly HeatmapTimelineSlot[] | null): void {
-    timelineSource = nextTimelineSource ? [...nextTimelineSource] : null;
-    timeline = buildSpectrumTimeline(timelineSource ?? []);
-    postHeatmapTimeline();
+  function setTimeline(nextTimeline: HeatmapTimeline | null): void {
+    timeline = nextTimeline;
     schedule(DIRTY.MAIN_BASE | DIRTY.OVERVIEW_BASE, true);
   }
 

@@ -1,4 +1,4 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import { pickRepresentativeIndex } from "./display-sampling.js";
 
 export type HeatmapTimelineSlot = readonly CFPBatch[] | null;
@@ -42,6 +42,13 @@ export type HeatmapBenchmarkEntry = {
   avgMs: number;
   sampleStrideFrames: number;
   optimizationLevel: HeatmapOptimizationLevel;
+};
+
+type BatchSummary = {
+  frameCount: number;
+  freqCount: number;
+  min: number;
+  max: number;
 };
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -94,12 +101,13 @@ const HEATMAP_PALETTE_U32 = (() => {
   return out;
 })();
 
-function summarizeBatch(batch: CFPBatch): {
-  frameCount: number;
-  freqCount: number;
-  min: number;
-  max: number;
-} {
+const BATCH_SUMMARY_CACHE = new WeakMap<CFPBatch, BatchSummary>();
+
+function summarizeBatch(batch: CFPBatch): BatchSummary {
+  const cached = BATCH_SUMMARY_CACHE.get(batch);
+  if (cached) {
+    return cached;
+  }
   const shape = batch.shape;
   const freqCount = Math.max(1, Math.floor(Number(shape?.[1]) || 1));
   const frameCount = Math.max(1, Math.floor(Number(shape?.[2]) || 1));
@@ -115,12 +123,14 @@ function summarizeBatch(batch: CFPBatch): {
   }
   if (!Number.isFinite(min)) min = 0;
   if (!Number.isFinite(max)) max = 0;
-  return {
+  const summary = {
     frameCount,
     freqCount,
     min,
     max,
   };
+  BATCH_SUMMARY_CACHE.set(batch, summary);
+  return summary;
 }
 
 export function buildSpectrumTimeline(

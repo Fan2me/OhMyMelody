@@ -10,11 +10,13 @@ export type PlotMetrics = {
   plotH: number;
 };
 
+const FRAME_RATE_HZ = 100;
+
 export function getMainViewFrameCount(state: Pick<SpectrumInteractionState, "spectrumW" | "spectrumZoom" | "spectrumDuration">): number {
-  let viewW = Math.floor(Math.max(0, Number(state.spectrumW) || 0) / Math.max(1, Number(state.spectrumZoom) || 1));
-  if (viewW > state.spectrumW) viewW = state.spectrumW;
-  if (viewW < 1) viewW = 1;
-  return Math.max(1, Math.floor(viewW));
+  const safeTotalFrames = Math.max(1, Math.floor(Number(state.spectrumW) || 0));
+  const safeZoom = Math.max(1, Number(state.spectrumZoom) || 1);
+  const baseViewFrames = Math.max(1, Math.floor(safeTotalFrames / safeZoom));
+  return Math.max(1, Math.min(safeTotalFrames, baseViewFrames));
 }
 
 export function clampSpectrumZoom(

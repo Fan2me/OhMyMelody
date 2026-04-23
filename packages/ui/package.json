@@ -12,6 +12,7 @@
     }
   },
   "dependencies": {
+    "@ohm/core": "workspace:*",
     "@ohm/runtime": "workspace:*"
   },
   "scripts": {

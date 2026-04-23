@@ -1,4 +1,5 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
+import { DIRTY } from "./spectrum-state.js";
 
 export interface ProgressiveSpectrumState {
   spectrumData: Float32Array;
@@ -12,16 +13,24 @@ export interface ProgressiveSpectrumState {
   renderedFrames: number;
 }
 
+export interface ProgressiveSpectrumPayload {
+  data: Float32Array;
+  width: number;
+  height: number;
+  argmax: Float32Array;
+  confidence: Float32Array;
+}
+
+export interface SpectrumRedrawRequest {
+  force?: boolean;
+  includeOverviewBase?: boolean;
+  dirtyMask?: number;
+}
+
 export interface ProgressiveSpectrumVisualizerOptions {
-  setSpectrumPayload?: ((payload: {
-    data: Float32Array;
-    width: number;
-    height: number;
-    argmax: Float32Array;
-    confidence: Float32Array;
-  }) => void) | null;
+  setSpectrumPayload?: ((payload: ProgressiveSpectrumPayload) => void) | null;
   setSpectrumDuration?: ((duration: number) => void) | null;
-  requestSpectrumRedraw?: ((full?: boolean | { force?: boolean; includeOverviewBase?: boolean; dirtyMask?: number }) => void) | null;
+  requestSpectrumRedraw?: ((full?: boolean | SpectrumRedrawRequest) => void) | null;
   markSpectrumDataDirty?: (() => void) | null;
   frameSec?: number;
   maxWindowFrames?: number;
@@ -80,6 +89,41 @@ function getBatchShape(batch: CFPBatch): [number, number, number] {
   return [C, F, T];
 }
 
+function copyPredictionSeries(
+  destination: Float32Array,
+  source: Float32Array,
+): void {
+  if (!destination.length || !source.length) {
+    return;
+  }
+  destination.set(source.subarray(0, Math.min(destination.length, source.length)));
+}
+
+function copySpectrumRows(
+  destination: Float32Array,
+  destinationWidth: number,
+  source: Float32Array,
+  sourceWidth: number,
+  rowCount: number,
+  frameCount: number,
+): void {
+  if (!destinationWidth || !sourceWidth || !rowCount || !frameCount) {
+    return;
+  }
+
+  const rows = Math.max(0, Math.min(rowCount, Math.floor(destination.length / destinationWidth)));
+  const frames = Math.max(0, Math.min(frameCount, destinationWidth, sourceWidth));
+  if (!rows || !frames) {
+    return;
+  }
+
+  for (let y = 0; y < rows; y += 1) {
+    const dstStart = y * destinationWidth;
+    const srcStart = y * sourceWidth;
+    destination.set(source.subarray(srcStart, srcStart + frames), dstStart);
+  }
+}
+
 export function createProgressiveSpectrumVisualizer(
   options: ProgressiveSpectrumVisualizerOptions = {},
 ): ProgressiveSpectrumVisualizer {
@@ -104,6 +148,7 @@ export function createProgressiveSpectrumVisualizer(
   let pendingDurationSec = 0;
   let queued = false;
   const pendingChunks: CFPBatch[] = [];
+  let pendingChunkReadIndex = 0;
   const state: ProgressiveSpectrumState = {
     spectrumData,
     spectrumW: 0,
@@ -128,13 +173,7 @@ export function createProgressiveSpectrumVisualizer(
     if (Object.prototype.hasOwnProperty.call(next, "renderedFrames")) state.renderedFrames = next.renderedFrames ?? state.renderedFrames;
   }
 
-  function applySpectrumPayload(payload: {
-    data: Float32Array;
-    width: number;
-    height: number;
-    argmax: Float32Array;
-    confidence: Float32Array;
-  }) {
+  function applySpectrumPayload(payload: ProgressiveSpectrumPayload): void {
     if (typeof setSpectrumPayload !== "function") return;
     setSpectrumPayload(payload);
   }
@@ -152,7 +191,7 @@ export function createProgressiveSpectrumVisualizer(
     }
   }
 
-  function requestRedraw(fullOrOptions: boolean | { force?: boolean; includeOverviewBase?: boolean; dirtyMask?: number } = false) {
+  function requestRedraw(fullOrOptions: boolean | SpectrumRedrawRequest = false): void {
     if (typeof requestSpectrumRedraw !== "function") return;
     requestSpectrumRedraw(fullOrOptions);
   }
@@ -168,21 +207,16 @@ export function createProgressiveSpectrumVisualizer(
     const blank = createBlankProgressiveSpectrumPayload(safeTotalFrames, height);
     if (preserveExisting && prevData.length > 0 && prevData !== EMPTY_FLOAT32) {
       const prevWidth = prevHeight > 0 ? Math.floor(prevData.length / prevHeight) : 0;
-      const copyFrames = Math.max(0, Math.min(blank.spectrumW, prevWidth));
-      if (copyFrames > 0 && prevWidth > 0) {
-        const copyRows = Math.max(0, Math.min(blank.spectrumH, prevHeight));
-        for (let y = 0; y < copyRows; y += 1) {
-          const dstStart = y * blank.spectrumW;
-          const srcStart = y * prevWidth;
-          blank.spectrumData.set(prevData.subarray(srcStart, srcStart + copyFrames), dstStart);
-        }
-      }
-      if (prevArgmax.length > 0) {
-        blank.predictionArgmax.set(prevArgmax.subarray(0, Math.min(prevArgmax.length, blank.predictionArgmax.length)));
-      }
-      if (prevConfidence.length > 0) {
-        blank.predictionConfidence.set(prevConfidence.subarray(0, Math.min(prevConfidence.length, blank.predictionConfidence.length)));
-      }
+      copySpectrumRows(
+        blank.spectrumData,
+        blank.spectrumW,
+        prevData,
+        prevWidth,
+        Math.min(blank.spectrumH, prevHeight),
+        prevWidth,
+      );
+      copyPredictionSeries(blank.predictionArgmax, prevArgmax);
+      copyPredictionSeries(blank.predictionConfidence, prevConfidence);
     }
 
     spectrumData = blank.spectrumData;
@@ -220,12 +254,21 @@ export function createProgressiveSpectrumVisualizer(
     }
   }
 
+  function scheduleChunkDrain(): void {
+    if (queued) {
+      return;
+    }
+    queued = true;
+    queueMicrotask(drainQueuedChunks);
+  }
+
   function drainQueuedChunks() {
     queued = false;
-    if (!pendingChunks.length) return;
+    if (pendingChunkReadIndex >= pendingChunks.length) return;
     let touched = false;
-    while (pendingChunks.length) {
-      const one = pendingChunks.shift();
+    while (pendingChunkReadIndex < pendingChunks.length) {
+      const one = pendingChunks[pendingChunkReadIndex];
+      pendingChunkReadIndex += 1;
       if (!one) continue;
       const [C, F, T] = getBatchShape(one);
       if (!Number.isFinite(C) || !Number.isFinite(F) || !Number.isFinite(T) || T <= 0) continue;
@@ -274,22 +317,17 @@ export function createProgressiveSpectrumVisualizer(
       state.sourceFrameOffset += T;
       touched = true;
     }
+    pendingChunks.length = 0;
+    pendingChunkReadIndex = 0;
     if (touched) {
       markDirty();
-      requestRedraw({ includeOverviewBase: true });
-    }
-    if (pendingChunks.length && !queued) {
-      queued = true;
-      setTimeout(drainQueuedChunks, 0);
+      requestRedraw({ dirtyMask: DIRTY.MAIN_BASE, force: false });
     }
   }
 
   function enqueueChunk(one: CFPBatch) {
     pendingChunks.push(one);
-    if (!queued) {
-      queued = true;
-      setTimeout(drainQueuedChunks, 0);
-    }
+    scheduleChunkDrain();
   }
 
   function applyPredictionChunk(args: {
@@ -314,7 +352,7 @@ export function createProgressiveSpectrumVisualizer(
       }
     }
     state.renderedFrames = Math.max(state.renderedFrames, start + maxCopy);
-    requestRedraw();
+    requestRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY, force: false });
   }
 
   function reset(next: {
@@ -324,6 +362,7 @@ export function createProgressiveSpectrumVisualizer(
     pushToUi?: boolean;
   } = {}) {
     pendingChunks.length = 0;
+    pendingChunkReadIndex = 0;
     queued = false;
     state.sourceFrameOffset = 0;
     state.windowFrameCount = 0;

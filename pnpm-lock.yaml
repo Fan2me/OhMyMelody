@@ -53,6 +53,9 @@ importers:
 
   packages/ui:
     dependencies:
+      '@ohm/core':
+        specifier: workspace:*
+        version: link:../core
       '@ohm/runtime':
         specifier: workspace:*
         version: link:../runtime

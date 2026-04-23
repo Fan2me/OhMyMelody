@@ -1,9 +1,10 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import { getModuleLogger } from "@ohm/core/logging/logger.js";
 import {
   AnalysisPhase,
   type Analyzer,
-} from "../../runtime/dist/index.js";
+  type AnalyzerPhaseEvent,
+} from "@ohm/runtime";
 import { buildSpectrumTimeline } from "./heatmap-render-core.js";
 import {
   type DisplaySamplingConfig,
@@ -59,6 +60,31 @@ export type {
 
 const uiLogger = getModuleLogger("core.ui.spectrum");
 const FRAME_SEC = 0.01;
+type AnalyzerAudioPhaseEvent = Extract<
+  AnalyzerPhaseEvent,
+  { phase: AnalysisPhase.AUDIO }
+>;
+type AnalyzerCfpPhaseEvent = Extract<
+  AnalyzerPhaseEvent,
+  { phase: AnalysisPhase.CFP }
+>;
+type AnalyzerInferencePhaseEvent = Extract<
+  AnalyzerPhaseEvent,
+  { phase: AnalysisPhase.INFERENCE }
+>;
+type AnalyzerOutputPhaseEvent = Extract<
+  AnalyzerPhaseEvent,
+  { phase: AnalysisPhase.OUTPUT }
+>;
+
+type AnalysisSessionState = {
+  token: number;
+  scheduledStepIndex: number;
+  finished: boolean;
+  stopRequested: boolean;
+  predictionOffset: number;
+  predictionChunkCount: number;
+};
 
 function isAbortLikeError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -109,10 +135,15 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
   let analysisToken = 0;
   let timeline = buildSpectrumTimeline([]);
   let cfpBatches: readonly CFPBatch[] = [];
-  let predictionOffset = 0;
-  let predictionChunkCount = 0;
-  let scheduledStepIndex = -1;
-  let finished = false;
+  const analysisSession: AnalysisSessionState = {
+    token: 0,
+    scheduledStepIndex: -1,
+    finished: false,
+    stopRequested: false,
+    predictionOffset: 0,
+    predictionChunkCount: 0,
+  };
+  let timelineRebuildRaf: number | null = null;
   let analysisDoneResolve: (() => void) | null = null;
   let analysisDoneReject: ((error: unknown) => void) | null = null;
   let analysisCompletionPromise: Promise<void> = Promise.resolve();
@@ -137,7 +168,27 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
         Math.max(0, interactionState.spectrumW - viewW),
       ),
     );
-    renderController.setTimeline(nextSource);
+    renderController.setTimeline(timeline);
+  }
+
+  function scheduleTimelineRebuild(force = false): void {
+    if (force || !windowRef) {
+      if (timelineRebuildRaf !== null && windowRef) {
+        windowRef.cancelAnimationFrame(timelineRebuildRaf);
+        timelineRebuildRaf = null;
+      }
+      rebuildTimelineFromBatches();
+      return;
+    }
+
+    if (timelineRebuildRaf !== null) {
+      return;
+    }
+
+    timelineRebuildRaf = windowRef.requestAnimationFrame(() => {
+      timelineRebuildRaf = null;
+      rebuildTimelineFromBatches();
+    });
   }
 
   function writePredictionChunk(
@@ -148,8 +199,10 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
       return;
     }
     const nextChunkCount = Math.max(0, Math.floor(predictionArgmax.length || 0));
-    const nextOffset = predictionOffset;
-    const startIndex = Math.max(0, Math.min(predictionChunkCount, nextChunkCount));
+    const startIndex = Math.max(
+      0,
+      Math.min(analysisSession.predictionChunkCount, nextChunkCount),
+    );
     const nextArgmax = predictionArgmax.slice(startIndex);
     const nextConfidence = predictionConfidence
       ? Array.prototype.slice.call(predictionConfidence, startIndex)
@@ -157,22 +210,54 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     progressiveVisualizer.applyPredictionChunk({
       predictionArgmax: nextArgmax,
       predictionConfidence: nextConfidence,
-      predictionOffset: nextOffset,
+      predictionOffset: startIndex,
     });
-    predictionOffset = nextOffset + nextArgmax.length;
-    predictionChunkCount = nextChunkCount;
+    analysisSession.predictionChunkCount = nextChunkCount;
+  }
+
+  function countCFPFrames(batches: readonly CFPBatch[]): number {
+    let total = 0;
+    for (const batch of batches) {
+      const frameCount = Math.max(
+        0,
+        Math.floor(Number(batch?.shape?.[2]) || 0),
+      );
+      total += frameCount;
+    }
+    return total;
+  }
+
+  function ensureVisualizerFrameCapacity(frameCount: number): void {
+    if (!progressiveVisualizer) {
+      return;
+    }
+    const nextFrameCount = Math.max(1, Math.floor(frameCount || 0));
+    if (nextFrameCount <= progressiveVisualizer.state.spectrumW) {
+      return;
+    }
+    const nextDurationSec = Math.max(
+      interactionState.spectrumDuration || 0,
+      nextFrameCount * FRAME_SEC,
+    );
+    progressiveVisualizer.ensureBase(
+      nextFrameCount,
+      nextDurationSec,
+      true,
+      true,
+    );
+    updateInteractionFrameMetrics(nextFrameCount);
   }
 
   function scheduleNextStep(nextIndex: number, token: number): void {
-    if (finished || token !== analysisToken) {
+    if (analysisSession.finished || analysisSession.stopRequested || token !== analysisToken) {
       return;
     }
-    if (nextIndex <= scheduledStepIndex) {
+    if (nextIndex <= analysisSession.scheduledStepIndex) {
       return;
     }
-    scheduledStepIndex = nextIndex;
+    analysisSession.scheduledStepIndex = nextIndex;
     void analyzer.step().catch((error) => {
-      if (finished || token !== analysisToken) {
+      if (analysisSession.finished || token !== analysisToken) {
         return;
       }
       analysisDoneReject?.(error);
@@ -211,24 +296,20 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     getInteractionState: () => interactionState,
     mainOverlayRenderer,
     overviewOverlayRenderer,
-    heatmapWorkerFactory: options.heatmapWorkerFactory ?? null,
-    heatmapWorkerUrl: options.heatmapWorkerUrl ?? null,
   });
 
   progressiveVisualizer = createProgressiveSpectrumVisualizer({
     setSpectrumPayload: () => {
-      renderController.requestSpectrumRedraw({ force: true, includeOverviewBase: true });
+      renderController.requestSpectrumRedraw({ force: true, includeOverviewBase: false });
     },
     setSpectrumDuration: (duration: number) => {
       interactionState.spectrumDuration = Math.max(0, duration);
     },
     requestSpectrumRedraw: (next) => {
-      renderController.requestSpectrumRedraw(
-        typeof next === "boolean" ? next : next?.force ?? false,
-      );
+      renderController.requestSpectrumRedraw(next);
     },
     markSpectrumDataDirty: () => {
-      renderController.requestSpectrumRedraw({ force: true, includeOverviewBase: true });
+      renderController.requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_BASE, force: false });
     },
     frameSec: FRAME_SEC,
     maxWindowFrames: 240000,
@@ -346,145 +427,205 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     };
   }
 
+  function resolveAudioDurationSec(audio: { pcm: Float32Array; fs: number }): number {
+    return audio.pcm.length / Math.max(1, audio.fs);
+  }
+
+  function completeAnalysisSession(): void {
+    analysisSession.finished = true;
+    analysisDoneResolve?.();
+    analysisDoneResolve = null;
+    analysisDoneReject = null;
+  }
+
+  function rejectAnalysisSession(error: unknown): void {
+    analysisDoneReject?.(error);
+    analysisDoneResolve = null;
+    analysisDoneReject = null;
+  }
+
+  function resetAnalysisSession(token: number): void {
+    analysisSession.token = token;
+    analysisSession.finished = false;
+    analysisSession.stopRequested = false;
+    analysisSession.scheduledStepIndex = -1;
+    analysisSession.predictionOffset = 0;
+    analysisSession.predictionChunkCount = 0;
+  }
+
+  function clearAnalysisSubscription(): void {
+    analysisCleanup?.();
+    analysisCleanup = null;
+  }
+
+  function resetTimelineSchedule(): void {
+    if (timelineRebuildRaf !== null && windowRef) {
+      windowRef.cancelAnimationFrame(timelineRebuildRaf);
+      timelineRebuildRaf = null;
+    }
+  }
+
+  function beginAnalysis(token: number): void {
+    clearAnalysisSubscription();
+    abortController?.abort("UI analyze restarted");
+    abortController = new AbortController();
+    resetAnalysisSession(token);
+    analysisCompletionPromise = new Promise<void>((resolve, reject) => {
+      analysisDoneResolve = resolve;
+      analysisDoneReject = reject;
+    });
+    void analysisCompletionPromise.catch(() => undefined);
+    emit({ status: "running", message: "Analyzing audio..." });
+  }
+
+  function updateInteractionFrameMetrics(frameCount: number): void {
+    interactionState.spectrumW = Math.max(1, frameCount);
+    interactionState.spectrumOffset = Math.max(
+      0,
+      Math.min(
+        interactionState.spectrumOffset,
+        Math.max(
+          0,
+          interactionState.spectrumW -
+            getMainViewFrameCount({
+              spectrumW: Math.max(1, interactionState.spectrumW),
+              spectrumZoom: interactionState.spectrumZoom,
+              spectrumDuration: interactionState.spectrumDuration,
+            }),
+        ),
+      ),
+    );
+  }
+
+  function handleAudioPhase(event: AnalyzerAudioPhaseEvent): void {
+    const reuseCFP = (event.data as { reuseCFP?: boolean }).reuseCFP === true;
+    const durationSec = resolveAudioDurationSec(event.data.audio);
+    const predictionFrameCount = Math.max(1, Math.round(durationSec / FRAME_SEC));
+
+    if (!reuseCFP) {
+      cfpBatches = [];
+      progressiveVisualizer?.reset({
+        expectedFrames: predictionFrameCount,
+        durationSec,
+        preserveExisting: false,
+        pushToUi: true,
+      });
+    } else {
+      cfpBatches = [...state.cfp];
+      progressiveVisualizer?.ensureBase(
+        predictionFrameCount,
+        durationSec,
+        true,
+        true,
+      );
+      scheduleTimelineRebuild(true);
+    }
+
+    analysisSession.predictionOffset = 0;
+    analysisSession.predictionChunkCount = 0;
+    updateInteractionFrameMetrics(predictionFrameCount);
+    emit(
+      {
+        audio: event.data.audio,
+        cfp: reuseCFP ? cfpBatches : [],
+        inference: null,
+      },
+      reuseCFP
+        ? DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY
+        : DIRTY.MAIN_BASE |
+            DIRTY.MAIN_OVERLAY |
+            DIRTY.OVERVIEW_BASE |
+            DIRTY.OVERVIEW_OVERLAY,
+    );
+    uiLogger.info(
+      `audio phase-end: index=${event.index} pcm=${event.data.audio.pcm.length} fs=${event.data.audio.fs}`,
+    );
+  }
+
+  function handleCFPPhase(event: AnalyzerCfpPhaseEvent): void {
+    cfpBatches = [...event.data.allCfp];
+    ensureVisualizerFrameCapacity(countCFPFrames(cfpBatches));
+    if (progressiveVisualizer) {
+      for (const batch of event.data.cfp) {
+        progressiveVisualizer.enqueueChunk(batch);
+      }
+    }
+    scheduleTimelineRebuild(event.data.complete === true);
+    emit({ cfp: cfpBatches });
+    uiLogger.info(
+      `cfp phase-end: index=${event.index} batches=${event.data.cfp.length} all=${cfpBatches.length}`,
+    );
+    if (!event.data.complete && !analysisSession.stopRequested) {
+      scheduleNextStep(event.index + 1, analysisSession.token);
+    }
+  }
+
+  function handleInferencePhase(event: AnalyzerInferencePhaseEvent): void {
+    writePredictionChunk(
+      event.data.inference.totalArgmax,
+      event.data.inference.totalConfidence,
+    );
+    emit(
+      { cfp: cfpBatches, inference: event.data.inference },
+      DIRTY.MAIN_OVERLAY,
+    );
+    uiLogger.info(
+      `inference phase-end: index=${event.index} prediction=${event.data.inference?.totalArgmax.length || 0}`,
+    );
+    if (analysisSession.stopRequested && !analysisSession.finished) {
+      progressiveVisualizer?.flush();
+      completeAnalysisSession();
+    }
+  }
+
+  function handleOutputPhase(event: AnalyzerOutputPhaseEvent): void {
+    progressiveVisualizer?.flush();
+    uiLogger.info(
+      `output phase-end: index=${event.index} audio=${event.data.audio.pcm.length} cfp=${event.data.cfp.length} prediction=${event.data.inference?.totalArgmax.length || 0}`,
+    );
+    completeAnalysisSession();
+  }
+
   async function analyze({
     input,
     execution = {},
   }: SpectrumUiAnalyzeOptions): Promise<void> {
     const token = ++analysisToken;
-    analysisCleanup?.();
-    analysisCleanup = null;
-    abortController?.abort("UI analyze restarted");
-    abortController = new AbortController();
-    finished = false;
-    scheduledStepIndex = -1;
-    analysisCompletionPromise = new Promise<void>((resolve, reject) => {
-      analysisDoneResolve = resolve;
-      analysisDoneReject = reject;
-    });
-    emit({ status: "running", message: "Analyzing audio..." });
+    beginAnalysis(token);
 
     analysisCleanup = analyzer.subscribe((event) => {
       if (token !== analysisToken) return;
       if (event.phase === AnalysisPhase.AUDIO) {
-        const reuseCFP = (event.data as { reuseCFP?: boolean }).reuseCFP === true;
-        const predictionFrameCount = Math.max(
-          1,
-          Math.round(
-            (event.data.audio.pcm.length / Math.max(1, event.data.audio.fs)) /
-              FRAME_SEC,
-          ),
-        );
-        if (!reuseCFP) {
-          cfpBatches = [];
-          progressiveVisualizer?.reset({
-            expectedFrames: predictionFrameCount,
-            durationSec: event.data.audio.pcm.length / Math.max(1, event.data.audio.fs),
-            preserveExisting: false,
-            pushToUi: true,
-          });
-        } else {
-          cfpBatches = [...state.cfp];
-          progressiveVisualizer?.ensureBase(
-            predictionFrameCount,
-            event.data.audio.pcm.length / Math.max(1, event.data.audio.fs),
-            true,
-            true,
-          );
-          rebuildTimelineFromBatches();
-        }
-        predictionOffset = 0;
-        predictionChunkCount = 0;
-        interactionState.spectrumW = Math.max(
-          1,
-          Math.round((event.data.audio.pcm.length / Math.max(1, event.data.audio.fs)) / FRAME_SEC),
-        );
-        interactionState.spectrumOffset = Math.max(
-          0,
-          Math.min(
-            interactionState.spectrumOffset,
-            Math.max(
-              0,
-              interactionState.spectrumW -
-                getMainViewFrameCount({
-                  spectrumW: Math.max(1, interactionState.spectrumW),
-                  spectrumZoom: interactionState.spectrumZoom,
-                  spectrumDuration: interactionState.spectrumDuration,
-                }),
-            ),
-          ),
-        );
-        if (!reuseCFP) {
-          emit(
-            { audio: event.data.audio, cfp: [], inference: null },
-            DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_BASE | DIRTY.OVERVIEW_OVERLAY,
-          );
-        } else {
-          emit(
-            { audio: event.data.audio, cfp: cfpBatches, inference: null },
-            DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY,
-          );
-        }
-        uiLogger.info(
-          `audio phase-end: index=${event.index} pcm=${event.data.audio.pcm.length} fs=${event.data.audio.fs}`,
-        );
+        handleAudioPhase(event);
         return;
       }
       if (event.phase === AnalysisPhase.CFP) {
-        cfpBatches = [...event.data.allCfp];
-        if (progressiveVisualizer) {
-          for (const batch of event.data.cfp) {
-            progressiveVisualizer.enqueueChunk(batch);
-          }
-        }
-        rebuildTimelineFromBatches();
-        emit({ cfp: cfpBatches }, DIRTY.MAIN_BASE | DIRTY.OVERVIEW_BASE);
-        uiLogger.info(
-          `cfp phase-end: index=${event.index} batches=${event.data.cfp.length} all=${cfpBatches.length}`,
-        );
-        if (!event.data.complete) {
-          scheduleNextStep(event.index + 1, token);
-        }
+        handleCFPPhase(event);
         return;
       }
       if (event.phase === AnalysisPhase.INFERENCE) {
-        writePredictionChunk(
-          event.data.inference.totalArgmax,
-          event.data.inference.totalConfidence,
-        );
-        emit({ cfp: cfpBatches, inference: event.data.inference }, DIRTY.MAIN_OVERLAY);
-        uiLogger.info(`inference phase-end: index=${event.index} prediction=${event.data.inference?.totalArgmax.length || 0}`);
+        handleInferencePhase(event);
         return;
       }
       if (event.phase === AnalysisPhase.OUTPUT) {
-        progressiveVisualizer?.flush();
-        cfpBatches = [...event.data.cfp];
-        rebuildTimelineFromBatches();
-        emit({
-          audio: event.data.audio,
-          cfp: cfpBatches,
-          inference: event.data.inference,
-        }, DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_BASE);
-        uiLogger.info(`output phase-end: index=${event.index} audio=${event.data.audio.pcm.length} cfp=${event.data.cfp.length} prediction=${event.data.inference?.totalArgmax.length || 0}`);
-        finished = true;
-        analysisDoneResolve?.();
-        analysisDoneResolve = null;
-        analysisDoneReject = null;
+        handleOutputPhase(event);
       }
     });
 
     try {
+      const signal = abortController?.signal ?? null;
       await analyzer.setAudio(input, {
         ...execution,
-        signal: abortController.signal,
+        signal,
       });
-      if (!finished) {
+      if (!analysisSession.finished) {
         scheduleNextStep(0, token);
       }
       await analysisCompletionPromise;
       emit({ status: "succeeded", message: null });
     } catch (error) {
       const aborted = isAbortLikeError(error);
-      if (!finished) {
+      if (!analysisSession.finished) {
         emit({
           status: aborted ? "cancelled" : "failed",
           message: aborted
@@ -493,33 +634,39 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
               ? error.message
               : "Analysis failed",
         });
-        finished = true;
+        analysisSession.finished = true;
       }
       analysisDoneResolve = null;
       analysisDoneReject = null;
       throw error;
     } finally {
-      analysisCleanup?.();
-      analysisCleanup = null;
+      clearAnalysisSubscription();
       abortController = null;
     }
   }
 
+  function requestStop(reason: unknown = "UI controller stop requested"): void {
+    if (analysisSession.finished) {
+      return;
+    }
+    analysisSession.stopRequested = true;
+    uiLogger.info(`analysis stop requested: ${String(reason)}`);
+  }
+
   function cancel(reason: unknown = "UI controller cancelled"): void {
     analysisToken += 1;
-    analysisCleanup?.();
-    analysisCleanup = null;
+    analysisSession.stopRequested = false;
+    resetTimelineSchedule();
+    clearAnalysisSubscription();
     abortController?.abort(reason);
     abortController = null;
-    finished = true;
-    analysisDoneReject?.(
+    analysisSession.finished = true;
+    rejectAnalysisSession(
       reason instanceof Error
         ? reason
         : new Error(getCancelMessage(reason)),
     );
-    analysisDoneResolve = null;
-    analysisDoneReject = null;
-      emit({ status: "cancelled", message: getCancelMessage(reason) });
+    emit({ status: "cancelled", message: getCancelMessage(reason) });
     renderController.requestSpectrumRedraw({ force: true });
   }
 
@@ -737,6 +884,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
 
   return {
     analyze,
+    requestStop,
     cancel,
     destroy,
     getState,

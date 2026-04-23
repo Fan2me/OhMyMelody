@@ -1,9 +1,9 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import type {
   AnalyzeExecutionOptions,
   AnalyzeInput,
   InferenceResult,
-} from "../../runtime/dist/index.js";
+} from "@ohm/runtime";
 import type { DisplaySamplingConfig, RepresentativeMode } from "./display-sampling.js";
 import { DEFAULT_DISPLAY_SAMPLING_CONFIG } from "./display-sampling.js";
 import type { HeatmapBenchmarkEntry } from "./heatmap-render-core.js";
@@ -64,8 +64,6 @@ export interface SpectrumUiOptions {
   }>;
   displaySampling?: Partial<DisplaySamplingConfig>;
   pitchRange?: Partial<SpectrumPitchRange>;
-  heatmapWorkerFactory?: (() => Worker | null) | null;
-  heatmapWorkerUrl?: string | URL;
   onStateChange?: ((state: SpectrumUiState) => void) | null;
   onRender?: ((mount: HTMLElement | null, state: SpectrumUiState) => void) | null;
 }
@@ -112,6 +110,7 @@ export interface SpectrumUiDebugState {
 
 export interface SpectrumUi {
   analyze(options: SpectrumUiAnalyzeOptions): Promise<void>;
+  requestStop(reason?: unknown): void;
   cancel(reason?: unknown): void;
   destroy(reason?: unknown): void;
   getState(): SpectrumUiState;
