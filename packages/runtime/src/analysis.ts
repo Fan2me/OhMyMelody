@@ -1,8 +1,8 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
-import {
-  estimateDurationSecFromCFPBatches,
-} from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
+import { estimateDurationSecFromCFPBatches } from "@ohm/core/cache/cfp.js";
 import { decodeAudioRaw } from "@ohm/core/audio/decoder.js";
+import { postProcessDecodedAudio } from "@ohm/core/audio/pcm.js";
+import { captureAudioFromMediaStream } from "@ohm/core/media/stream-capture.js";
 import type {
   AnalyzeExecutionOptions,
   AnalyzeInput,
@@ -83,9 +83,7 @@ export type AnalyzerPhaseEvent = {
   };
 }[AnalysisPhase];
 
-export type AnalyzerEventListener = (
-  event: AnalyzerPhaseEvent,
-) => void;
+export type AnalyzerEventListener = (event: AnalyzerPhaseEvent) => void;
 
 export interface Analyzer {
   subscribe(listener: AnalyzerEventListener): () => void;
@@ -102,6 +100,11 @@ export function createAnalysisState(): AnalysisState {
     analysisPlan: null,
     nextPlanIndex: 0,
   };
+}
+
+export function resolveAnalyzeFileKey(input: AnalyzeInput): string {
+  const sourceLabel = String(input.source.label || "").trim();
+  return String(input.fileKey || sourceLabel || "").trim();
 }
 
 export function sourceToBlob(source: AnalyzeInput["source"]): Blob {
@@ -133,6 +136,14 @@ export function createAnalysisResult<TArtifact>(
 export async function decodeInputAudio(
   input: AnalyzeInput,
 ): Promise<{ pcm: Float32Array; fs: number; mode?: string }> {
+  if (input.source.kind === "stream") {
+    const audioBuffer = await captureAudioFromMediaStream(input.source.stream);
+    return postProcessDecodedAudio({
+      audioBuffer,
+      sampleRate: audioBuffer.sampleRate,
+    });
+  }
+
   const blob = sourceToBlob(input.source);
   return await decodeAudioRaw(blob);
 }

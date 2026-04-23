@@ -1,11 +1,12 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
-import {
-  buildCFPAnalysisCacheKey,
-  CFPIndexedDBCache,
-} from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
+import { CFPIndexedDBCache } from "@ohm/core/cache/cfp.js";
 import { isAbortError, throwIfAborted } from "@ohm/core/abort/abort.js";
 import { isPyodideOOMError, splitCFPRangeOnOOM } from "@ohm/core/cfp/cfp.js";
 import { runCFPChunkInPyodide } from "@ohm/core/cfp/chunk.js";
+import {
+  CORE_CFP_SCRIPT_URL,
+  CORE_CFP_WORKER_MODULE_URL,
+} from "@ohm/core/cfp/index.js";
 import {
   type CFPBootstrapEnvironment,
   initializePyodideForCFP,
@@ -21,7 +22,6 @@ import type {
   CFPWorkerTimingMessage,
   WorkerLike,
 } from "@ohm/core/cfp/types.js";
-import type { AnalyzeExecutionOptions, AnalyzeInput } from "../types.js";
 
 const cfpLogger = getModuleLogger("core.runtime.cfp");
 const processLogger = getModuleLogger("core.runtime.cfp.process");
@@ -29,8 +29,23 @@ const processLogger = getModuleLogger("core.runtime.cfp.process");
 const PYODIDE_CDN_VERSION = "0.25.1";
 const defaultPyodideScriptUrl = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_CDN_VERSION}/full/pyodide.js`;
 const defaultPyodideIndexURL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_CDN_VERSION}/full/`;
-const defaultCFPScriptUrl = new URL("../../../core/cfp.py", import.meta.url).toString();
+const defaultCFPScriptUrl = CORE_CFP_SCRIPT_URL;
 const cfpCacheBackend = "runtime-v2";
+
+function buildCFPCacheKey({
+  namespace,
+  fileKey,
+  backend = cfpCacheBackend,
+}: {
+  namespace: string;
+  fileKey: string;
+  backend?: string;
+}): string {
+  return [namespace, fileKey, backend]
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .join("::");
+}
 
 type PyodideWorkerLike = PyodideLike & {
   toPy(value: Float32Array): { destroy?: () => void };
@@ -331,11 +346,6 @@ async function runCFPWithResidentWorker({
   }
 }
 
-function resolveAnalysisFileKey(input: AnalyzeInput): string {
-  const sourceLabel = String(input.source.label || "").trim();
-  return String(input.fileKey || sourceLabel || "analysis").trim();
-}
-
 export interface CFPManagerOptions {
   label?: string;
   pyodideScriptUrl?: string;
@@ -345,8 +355,9 @@ export interface CFPManagerOptions {
 }
 
 export interface CFPCheckCacheInput {
-  input: AnalyzeInput;
-  execution: Readonly<AnalyzeExecutionOptions>;
+  fileKey: string;
+  allowCache?: boolean;
+  forceRefresh?: boolean;
 }
 
 export interface CFPCheckCacheResult {
@@ -355,20 +366,28 @@ export interface CFPCheckCacheResult {
 }
 
 export interface CFPProcessInput {
-  input: AnalyzeInput;
-  execution: Readonly<AnalyzeExecutionOptions>;
-  previousBatches: readonly CFPBatch[];
+  fileKey: string;
+  batchOffset?: number;
   segment: CFPChunkInput;
-  signal: AbortSignal | null;
-  complete: boolean;
+  signal?: AbortSignal | null;
+  complete?: boolean;
+  allowCache?: boolean;
+  forceRefresh?: boolean;
 }
 
-export interface CFPProcessResult {
-  fileKey: string;
-  batches: readonly CFPBatch[];
-  allBatches: readonly CFPBatch[];
-  complete: boolean;
-}
+export type CFPProcessResult =
+  | {
+      kind: "cache-hit";
+      fileKey: string;
+      batches: readonly CFPBatch[];
+      complete: true;
+    }
+  | {
+      kind: "segment";
+      fileKey: string;
+      batches: readonly CFPBatch[];
+      complete: boolean;
+    };
 
 export class CFPManager {
   private readonly analyzerLabel: string;
@@ -402,7 +421,7 @@ export class CFPManager {
     this.cfpScriptUrl = cfpScriptUrl;
     this.createWorkerInstance = createWorkerInstance;
     cfpLogger.info(
-      `runtime cfp manager ready: worker=${String(new URL("../../../core/dist/cfp/worker.js", import.meta.url))} pyodide=${this.pyodideScriptUrl} cfp=${this.cfpScriptUrl}`,
+      `runtime cfp manager ready: worker=${CORE_CFP_WORKER_MODULE_URL} pyodide=${this.pyodideScriptUrl} cfp=${this.cfpScriptUrl}`,
     );
     this.cache = new CFPIndexedDBCache({
       normalizeCFPBatches: normalizeCFPBatches,
@@ -418,10 +437,7 @@ export class CFPManager {
           }
         }
         try {
-          return new Worker(
-            new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url),
-            { type: "module" },
-          );
+          return new Worker(CORE_CFP_WORKER_MODULE_URL, { type: "module" });
         } catch {
           return null;
         }
@@ -433,8 +449,8 @@ export class CFPManager {
     void this.workerManager.prewarmCFPWorker().then((ready) => {
       cfpLogger.info(
         ready
-          ? `runtime cfp worker prewarm ready: ${String(new URL("../../../core/dist/cfp/worker.js", import.meta.url))}`
-          : `runtime cfp worker prewarm skipped or unavailable: ${String(new URL("../../../core/dist/cfp/worker.js", import.meta.url))}`,
+          ? `runtime cfp worker prewarm ready: ${CORE_CFP_WORKER_MODULE_URL}`
+          : `runtime cfp worker prewarm skipped or unavailable: ${CORE_CFP_WORKER_MODULE_URL}`,
       );
     });
   }
@@ -449,17 +465,17 @@ export class CFPManager {
   }
 
   async checkCache({
-    input,
-    execution,
+    fileKey,
+    allowCache = true,
+    forceRefresh = false,
   }: CFPCheckCacheInput): Promise<CFPCheckCacheResult> {
-    const fileKey = resolveAnalysisFileKey(input);
-    const cacheKey = buildCFPAnalysisCacheKey({
+    const cacheKey = buildCFPCacheKey({
       namespace: this.analyzerLabel,
       fileKey,
       backend: cfpCacheBackend,
     });
 
-    if (execution.allowCache !== false && !execution.forceRefresh && cacheKey) {
+    if (allowCache !== false && !forceRefresh && cacheKey) {
       const cached = await this.cache.getCFPCache(cacheKey, {
         allowPartial: false,
       });
@@ -503,7 +519,7 @@ export class CFPManager {
       if (worker) {
         this.residentWorker = worker;
         cfpLogger.info(
-          `runtime cfp resident worker ready: ${String(new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url))}`,
+          `runtime cfp resident worker ready: ${CORE_CFP_WORKER_MODULE_URL}`,
         );
         return worker;
       }
@@ -511,10 +527,7 @@ export class CFPManager {
       try {
         worker = this.createWorkerInstance
           ? this.createWorkerInstance()
-          : new Worker(
-              new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url),
-              { type: "module" },
-            );
+          : new Worker(CORE_CFP_WORKER_MODULE_URL, { type: "module" });
       } catch {
         return null;
       }
@@ -529,7 +542,7 @@ export class CFPManager {
       );
       if (!ready) {
         cfpLogger.warn(
-          `runtime cfp resident worker init failed: ${String(new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url))}${initFailureReason ? ` reason=${initFailureReason}` : ""}`,
+          `runtime cfp resident worker init failed: ${CORE_CFP_WORKER_MODULE_URL}${initFailureReason ? ` reason=${initFailureReason}` : ""}`,
         );
         this.workerManager.terminateWorkerSafely(worker);
         return null;
@@ -540,7 +553,7 @@ export class CFPManager {
         this.workerManager.setPrewarmedWorker(worker);
       }
       cfpLogger.info(
-        `runtime cfp resident worker ready: ${String(new URL("../../../core/dist/cfp/worker.js?worker", import.meta.url))}`,
+        `runtime cfp resident worker ready: ${CORE_CFP_WORKER_MODULE_URL}`,
       );
       return worker;
     })().finally(() => {
@@ -551,31 +564,32 @@ export class CFPManager {
   }
 
   async process({
-    input,
-    execution,
-    previousBatches,
+    fileKey,
+    batchOffset = 0,
     segment,
-    signal,
-    complete,
+    signal = null,
+    complete = false,
+    allowCache = true,
+    forceRefresh = false,
   }: CFPProcessInput): Promise<CFPProcessResult> {
     return await this.enqueueProcess(async () => {
-      const fileKey = resolveAnalysisFileKey(input);
-      const cacheKey = buildCFPAnalysisCacheKey({
+      const cacheKey = buildCFPCacheKey({
         namespace: this.analyzerLabel,
         fileKey,
         backend: cfpCacheBackend,
       });
 
-      if (!previousBatches.length) {
+      if (batchOffset <= 0) {
         const cacheState = await this.checkCache({
-          input,
-          execution,
+          fileKey,
+          allowCache,
+          forceRefresh,
         });
         if (cacheState.batches?.length) {
           return {
+            kind: "cache-hit",
             fileKey: cacheState.fileKey,
             batches: cacheState.batches,
-            allBatches: cacheState.batches,
             complete: true,
           };
         }
@@ -585,19 +599,19 @@ export class CFPManager {
         input: segment,
         signal,
       });
-      const allBatches = [...previousBatches, ...batches];
       await this.commitCache({
         cacheKey,
-        batches: allBatches,
-        allowCache: execution.allowCache !== false,
+        batches,
+        startIndex: batchOffset,
+        allowCache,
         complete,
       });
 
       return {
+        kind: "segment",
         fileKey,
         batches,
-        allBatches,
-        complete: false,
+        complete,
       };
     });
   }
@@ -647,11 +661,13 @@ export class CFPManager {
   async commitCache({
     cacheKey,
     batches,
+    startIndex,
     allowCache,
     complete,
   }: {
     cacheKey: string;
     batches: readonly CFPBatch[];
+    startIndex: number;
     allowCache: boolean;
     complete: boolean;
   }): Promise<void> {
@@ -662,21 +678,22 @@ export class CFPManager {
       return;
     }
     try {
-      for (let index = 0; index < batches.length; index += 1) {
-        const batch = batches[index];
+      for (let localIndex = 0; localIndex < batches.length; localIndex += 1) {
+        const batch = batches[localIndex];
         if (!batch) {
           continue;
         }
+        const index = startIndex + localIndex;
         await this.cache.appendCFPCacheChunk(cacheKey, batch, {
           index,
           reset: index === 0,
-          complete: complete === true && index === batches.length - 1,
-          expectedChunkCount: batches.length,
+          complete: complete === true && localIndex === batches.length - 1,
+          expectedChunkCount: startIndex + batches.length,
         });
       }
       if (complete) {
         await this.cache.finalizeCFPCache(cacheKey, {
-          chunkCount: batches.length,
+          chunkCount: startIndex + batches.length,
         });
       }
       cfpLogger.info(

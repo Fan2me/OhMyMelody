@@ -1,4 +1,4 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import type { InferenceResult } from "./analysis.js";
 
 export type SourceDescriptor =

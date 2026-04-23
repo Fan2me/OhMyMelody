@@ -1,8 +1,16 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import { getModuleLogger } from "@ohm/core/logging/logger.js";
 import { toPositiveFinite } from "@ohm/core/cfp/common.js";
 import {
+  DEFAULT_TARGET_SAMPLE_RATE,
+  concatFloat32Chunks,
+  mixDownChannelsToMono,
+  postProcessDecodedAudio,
+} from "@ohm/core/audio/pcm.js";
+import { captureAudioFromMediaStream } from "@ohm/core/media/stream-capture.js";
+import {
   createAnalysisState,
+  resolveAnalyzeFileKey,
   type AnalyzerEventListener,
   type AnalyzerPhaseEventDataMap,
   type AnalyzerPhaseEvent,
@@ -30,16 +38,17 @@ type AnalyzerAudioManagerLike = Pick<
 
 type AnalyzerCFPManagerLike = {
   process(input: {
-    input: AnalyzeInput;
-    execution: Readonly<AnalyzeExecutionOptions>;
-    previousBatches: readonly CFPBatch[];
+    fileKey: string;
+    batchOffset?: number;
     segment: { pcm: Float32Array; fs: number };
-    signal: AbortSignal | null;
-    complete: boolean;
+    signal?: AbortSignal | null;
+    complete?: boolean;
+    allowCache?: boolean;
+    forceRefresh?: boolean;
   }): Promise<{
+    kind: "cache-hit" | "segment";
     fileKey: string;
     batches: readonly CFPBatch[];
-    allBatches: readonly CFPBatch[];
     complete: boolean;
   }>;
 };
@@ -75,144 +84,159 @@ export { InferenceManager } from "./managers/inference-manager.js";
 
 const analyzerLogger = getModuleLogger("core.runtime.analyzer");
 
-function clampNumber(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
+type SampleQueue = {
+  chunks: Float32Array[];
+  totalSamples: number;
+};
+
+type AnalyzerRunState = {
+  input: AnalyzeInput;
+  execution: Readonly<AnalyzeExecutionOptions>;
+  fileKey: string;
+  cfpBatches: readonly CFPBatch[];
+  cfpComplete: boolean;
+  reuseCFP: boolean;
+  outputEmitted: boolean;
+  lastInferenceResult: InferenceResult | null;
+  streamingAudioChunks: Float32Array[];
+  streamingAudioTotalSamples: number;
+};
+
+type AnalyzerCFPProcessResult = Awaited<
+  ReturnType<AnalyzerCFPManagerLike["process"]>
+>;
+function createSampleQueue(): SampleQueue {
+  return {
+    chunks: [],
+    totalSamples: 0,
+  };
+}
+
+function enqueueSamples(queue: SampleQueue, samples: Float32Array): void {
+  if (!samples.length) {
+    return;
+  }
+  queue.chunks.push(samples);
+  queue.totalSamples += samples.length;
+}
+
+function takeSamples(
+  queue: SampleQueue,
+  sampleCount: number,
+): Float32Array | null {
+  const take = Math.max(0, Math.floor(sampleCount));
+  if (!take || queue.totalSamples < take) {
+    return null;
+  }
+
+  const out = new Float32Array(take);
+  let offset = 0;
+  while (offset < take && queue.chunks.length > 0) {
+    const head = queue.chunks[0];
+    if (!head) {
+      queue.chunks.shift();
+      continue;
+    }
+    const available = head.length;
+    const need = take - offset;
+    const copyCount = Math.min(available, need);
+    out.set(head.subarray(0, copyCount), offset);
+    offset += copyCount;
+    queue.totalSamples -= copyCount;
+    if (copyCount === available) {
+      queue.chunks.shift();
+    } else {
+      queue.chunks[0] = head.subarray(copyCount);
+    }
+  }
+
+  return offset === take ? out : out.slice(0, offset);
+}
+
+function drainSamples(queue: SampleQueue): Float32Array {
+  if (!queue.totalSamples || !queue.chunks.length) {
+    return new Float32Array(0);
+  }
+  return takeSamples(queue, queue.totalSamples) ?? new Float32Array(0);
+}
+
+function padSamplesToLength(
+  samples: Float32Array,
+  targetLength: number,
+): Float32Array {
+  const target = Math.max(0, Math.floor(targetLength));
+  if (target <= 0) {
+    return new Float32Array(0);
+  }
+  if (samples.length >= target) {
+    return samples;
+  }
+  const padded = new Float32Array(target);
+  padded.set(samples);
+  return padded;
 }
 
 export function buildAnalysisPlan(
   totalSamples: number,
   sampleRate: number,
-  options: {
-    chunkSec?: number;
-    steadyChunkSec?: number;
-    adaptiveChunkSec?: boolean;
-    firstChunkSec?: number;
-    warmupChunkSec?: number;
-    warmupChunks?: number;
-    rampChunks?: number;
-  } = {},
-  batchSec = 10,
 ): AnalysisPlan {
-  const total = Math.max(0, Math.floor(toPositiveFinite(totalSamples, 0) ?? 0));
-  const sr = Math.max(1, Math.floor(toPositiveFinite(sampleRate, 1) ?? 1));
-  const explicitChunkSec = toPositiveFinite(options.chunkSec, null);
-  const defaultSteadyChunkSec = clampNumber(
-    toPositiveFinite(
-      options.steadyChunkSec,
-      toPositiveFinite(batchSec, 8) ?? 8,
-    ) ?? 8,
-    1,
-    100,
-  );
-  const shouldAdaptive = options.adaptiveChunkSec === true;
+  const total = Math.max(0, Math.floor(toPositiveFinite(totalSamples, 0)));
+  const sr = Math.max(1, Math.floor(toPositiveFinite(sampleRate, 1)));
+  const warmUpChunkSec = 1.28;
+  const warmUpChunkSize = warmUpChunkSec * sr;
+  const warmUpRounds = 3;
+  const steadyChunkSec = 5.12;
+  const steadyChunkSize = steadyChunkSec * sr;
 
   const tasks: AnalysisPlanTask[] = [];
   if (total <= 0) {
     return tasks;
   }
 
-  if (explicitChunkSec) {
-    const fixedSamples = Math.max(
-      1,
-      Math.floor(sr * clampNumber(explicitChunkSec, 0.5, 30)),
-    );
-    for (let start = 0; start < total; start += fixedSamples) {
-      const end = Math.min(start + fixedSamples, total);
-      tasks.push({ start, end });
-    }
-    return tasks;
-  }
-
-  if (!shouldAdaptive) {
-    const fixedSamples = Math.max(1, Math.floor(sr * defaultSteadyChunkSec));
-    for (let start = 0; start < total; start += fixedSamples) {
-      const end = Math.min(start + fixedSamples, total);
-      tasks.push({ start, end });
-    }
-    return tasks;
-  }
-
-  const steadySec = defaultSteadyChunkSec;
-  const firstSec = clampNumber(
-    toPositiveFinite(options.firstChunkSec, 0.8) ?? 0.8,
-    0.5,
-    steadySec,
-  );
-  const warmupSec = clampNumber(
-    toPositiveFinite(options.warmupChunkSec, 1.6) ?? 1.6,
-    firstSec,
-    steadySec,
-  );
-  const warmupChunks = Math.max(
-    1,
-    Math.floor(toPositiveFinite(options.warmupChunks, 2) ?? 2),
-  );
-  const rampChunks = Math.max(
-    0,
-    Math.floor(toPositiveFinite(options.rampChunks, 2) ?? 2),
-  );
-
   let start = 0;
-  let chunkIdx = 0;
-  while (start < total) {
-    let sec = steadySec;
-    if (chunkIdx === 0) {
-      sec = firstSec;
-    } else if (chunkIdx < warmupChunks) {
-      sec = warmupSec;
-    } else if (chunkIdx < warmupChunks + rampChunks) {
-      const rampIdx = chunkIdx - warmupChunks + 1;
-      const rampFrac = rampIdx / (rampChunks + 1);
-      sec = warmupSec + (steadySec - warmupSec) * rampFrac;
-    }
-    const size = Math.max(1, Math.floor(sr * sec));
-    const end = Math.min(start + size, total);
+  for (let round = 0; round < warmUpRounds && start < total; round++) {
+    const end = Math.min(start + warmUpChunkSize, total);
     tasks.push({ start, end });
     start = end;
-    chunkIdx += 1;
+  }
+  while (start < total) {
+    const end = Math.min(start + steadyChunkSize, total);
+    tasks.push({ start, end });
+    start = end;
   }
 
   return tasks;
 }
 
-export function createAnalyzer(
-  options: CreateAnalyzerOptions = {},
-): Analyzer {
+export function createAnalyzer(opt: CreateAnalyzerOptions = {}): Analyzer {
   const analyzerLabel = "runtime";
-  const batchSec = 4;
+  const analysisChunkSec = 1.28;
 
-  const audioManager = options.audioManager ?? new AudioManager();
-  const cfpManager = options.cfpManager ?? new CFPManager({ label: analyzerLabel });
-  const inferenceManager =
-    options.inferenceManager ?? new InferenceManager();
+  const audioManager = opt.audioManager ?? new AudioManager();
+  const cfpManager = opt.cfpManager ?? new CFPManager({ label: analyzerLabel });
+  const inferenceManager = opt.inferenceManager ?? new InferenceManager();
   const phaseListeners = new Set<AnalyzerEventListener>();
 
   let activeState = createAnalysisState();
   let activeContext: AnalysisContext | null = null;
-  let lastInferenceResult: InferenceResult | null = null;
-  let currentCFPBatches: readonly CFPBatch[] = [];
-  let currentCFPComplete = false;
-  let currentInput: AnalyzeInput | null = null;
-  let currentExecution: Readonly<AnalyzeExecutionOptions> | null = null;
-  let reuseCFPBatchesForCurrentRun = false;
-  let outputEmitted = false;
+  let activeRun: AnalyzerRunState | null = null;
   let analysisGeneration = 0;
   let stepQueue: Promise<void> = Promise.resolve();
   let inferenceQueue: Promise<void> = Promise.resolve();
+  let streamingAnalysisActive = false;
+  let streamingAnalysisPromise: Promise<void> | null = null;
 
   function resetActiveState(
     input: AnalyzeInput,
     execution: AnalyzeExecutionOptions,
   ): void {
-    const previousInput = currentInput;
-    const previousCFPBatches = currentCFPBatches;
-    const previousCFPComplete = currentCFPComplete;
-    const nextFileKey = String(input.fileKey || input.source.label || "").trim();
-    const previousFileKey = String(previousInput?.fileKey || previousInput?.source.label || "").trim();
+    const previousRun = activeRun;
+    const nextFileKey = resolveAnalyzeFileKey(input);
+    const previousFileKey = previousRun?.fileKey ?? "";
     const shouldReuseCFP =
       execution.forceRefresh !== true &&
-      previousCFPBatches.length > 0 &&
-      previousCFPComplete === true &&
+      (previousRun?.cfpBatches.length ?? 0) > 0 &&
+      previousRun?.cfpComplete === true &&
       nextFileKey.length > 0 &&
       nextFileKey === previousFileKey;
 
@@ -220,14 +244,21 @@ export function createAnalyzer(
     stepQueue = Promise.resolve();
     inferenceQueue = Promise.resolve();
     activeState = createAnalysisState();
-    currentCFPBatches = shouldReuseCFP ? [...previousCFPBatches] : [];
-    currentCFPComplete = shouldReuseCFP;
-    reuseCFPBatchesForCurrentRun = shouldReuseCFP;
-    currentInput = input;
-    currentExecution = execution;
-    outputEmitted = false;
+    activeRun = {
+      input,
+      execution,
+      fileKey: nextFileKey,
+      cfpBatches: shouldReuseCFP ? [...(previousRun?.cfpBatches ?? [])] : [],
+      cfpComplete: shouldReuseCFP,
+      reuseCFP: shouldReuseCFP,
+      outputEmitted: false,
+      lastInferenceResult: null,
+      streamingAudioChunks: [],
+      streamingAudioTotalSamples: 0,
+    };
     inferenceManager.reset();
-    lastInferenceResult = null;
+    streamingAnalysisActive = false;
+    streamingAnalysisPromise = null;
     activeContext = {
       state: activeState,
       phase: AnalysisPhase.AUDIO,
@@ -240,6 +271,14 @@ export function createAnalyzer(
       throw new Error("runtime context is unavailable");
     }
     return context;
+  }
+
+  function requireRun(): AnalyzerRunState {
+    const run = activeRun;
+    if (!run) {
+      throw new Error("runtime run is unavailable");
+    }
+    return run;
   }
 
   function requirePlan(): AnalysisPlan {
@@ -264,6 +303,434 @@ export function createAnalyzer(
       throw new Error("runtime plan step is unavailable");
     }
     return task;
+  }
+
+  function applyCFPResult(
+    run: AnalyzerRunState,
+    result: AnalyzerCFPProcessResult,
+  ): void {
+    run.cfpBatches =
+      result.kind === "cache-hit"
+        ? [...result.batches]
+        : [...run.cfpBatches, ...result.batches];
+    run.cfpComplete = result.complete;
+  }
+
+  function emitCFPPhase(
+    index: number,
+    result: AnalyzerCFPProcessResult,
+  ): void {
+    const run = requireRun();
+    emitPhaseEnd(AnalysisPhase.CFP, index, {
+      cfp: result.batches,
+      allCfp: run.cfpBatches,
+      complete: result.complete,
+    });
+  }
+
+  async function emitInferenceProgress({
+    generation,
+    stepIndex,
+    batches,
+    completeRun,
+  }: {
+    generation: number;
+    stepIndex: number;
+    batches: readonly CFPBatch[];
+    completeRun: boolean;
+  }): Promise<void> {
+    const run = requireRun();
+    setPhase(AnalysisPhase.INFERENCE);
+    analyzerLogger.info(
+      `runtime analyzer inference start: model=${run.input.model.name}`,
+    );
+
+    let inferenceCacheHit = false;
+    const shouldProbeInferenceCache =
+      run.execution.allowCache !== false &&
+      run.execution.forceRefresh !== true &&
+      completeRun &&
+      batches.length > 1 &&
+      typeof inferenceManager.hasCache === "function" &&
+      run.fileKey.length > 0;
+
+    if (shouldProbeInferenceCache) {
+      try {
+        inferenceCacheHit = await inferenceManager.hasCache!(
+          run.fileKey,
+          run.input.model.name,
+        );
+      } catch {
+        inferenceCacheHit = false;
+      }
+    }
+
+    const shouldProgressiveReplay =
+      completeRun &&
+      batches.length > 1 &&
+      !inferenceCacheHit;
+
+    if (shouldProgressiveReplay) {
+      analyzerLogger.info(
+        `runtime analyzer inference progressive replay: model=${run.input.model.name}`,
+      );
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+        if (generation !== analysisGeneration) {
+          return;
+        }
+        const batch = batches[batchIndex];
+        if (!batch) {
+          continue;
+        }
+        const isLastBatch = batchIndex + 1 >= batches.length;
+        const inferenceResult = await inferenceManager.process({
+          batches: [batch],
+          modelName: run.input.model.name,
+          fileKey: run.fileKey,
+          allowCache: run.execution.allowCache !== false,
+          forceRefresh: run.execution.forceRefresh === true,
+          complete: completeRun && isLastBatch,
+        });
+        if (generation !== analysisGeneration) {
+          return;
+        }
+        run.lastInferenceResult = inferenceResult;
+        emitPhaseEnd(AnalysisPhase.INFERENCE, stepIndex, {
+          cfp: [batch],
+          allCfp: run.cfpBatches,
+          inference: inferenceResult,
+        });
+      }
+      analyzerLogger.info(
+        `runtime analyzer inference progressive replay done: model=${run.input.model.name}`,
+      );
+      return;
+    }
+
+    const inferenceResult = await inferenceManager.process({
+      batches,
+      modelName: run.input.model.name,
+      fileKey: run.fileKey,
+      allowCache: run.execution.allowCache !== false,
+      forceRefresh: run.execution.forceRefresh === true,
+      complete: completeRun,
+    });
+    if (generation !== analysisGeneration) {
+      return;
+    }
+    run.lastInferenceResult = inferenceResult;
+    analyzerLogger.info(
+      `runtime analyzer inference done: model=${run.input.model.name}`,
+    );
+    emitPhaseEnd(AnalysisPhase.INFERENCE, stepIndex, {
+      cfp: batches,
+      allCfp: run.cfpBatches,
+      inference: inferenceResult,
+    });
+  }
+
+  async function applyCFPAndRunInference({
+    generation,
+    stepIndex,
+    result,
+    completeRun,
+    emitCFP = true,
+  }: {
+    generation: number;
+    stepIndex: number;
+    result: AnalyzerCFPProcessResult;
+    completeRun: boolean;
+    emitCFP?: boolean;
+  }): Promise<void> {
+    if (generation !== analysisGeneration) {
+      return;
+    }
+    const run = requireRun();
+    applyCFPResult(run, result);
+    if (emitCFP) {
+      emitCFPPhase(stepIndex, result);
+    }
+    await emitInferenceProgress({
+      generation,
+      stepIndex,
+      batches: result.batches,
+      completeRun,
+    });
+    if (generation !== analysisGeneration) {
+      return;
+    }
+    if (completeRun) {
+      emitOutputPhase(
+        activeState.analysisPlan?.length ?? stepIndex + 1,
+      );
+    } else {
+      setPhase(AnalysisPhase.CFP);
+    }
+  }
+
+  async function processStreamingSegment({
+    token,
+    segment,
+    index,
+    final,
+  }: {
+    token: number;
+    segment: Float32Array;
+    index: number;
+    final: boolean;
+  }): Promise<void> {
+    if (token !== analysisGeneration || !segment.length) {
+      return;
+    }
+
+    const run = requireRun();
+
+    const segmentResult = await processCFPSegment(
+      run,
+      {
+        pcm: segment,
+        fs: DEFAULT_TARGET_SAMPLE_RATE,
+      },
+      final,
+      {
+        allowCache: false,
+        forceRefresh: true,
+      },
+    );
+
+    if (token !== analysisGeneration) {
+      return;
+    }
+
+    await applyCFPAndRunInference({
+      generation: token,
+      stepIndex: index,
+      result: {
+        ...segmentResult,
+        kind: "segment",
+      },
+      completeRun: final,
+    });
+  }
+
+  async function processCFPSegment(
+    run: AnalyzerRunState,
+    segment: { pcm: Float32Array; fs: number },
+    complete: boolean,
+    options: {
+      allowCache: boolean;
+      forceRefresh: boolean;
+    },
+  ): Promise<AnalyzerCFPProcessResult> {
+    return await cfpManager.process({
+      fileKey: run.fileKey,
+      batchOffset: run.cfpBatches.length,
+      segment,
+      signal: run.execution.signal ?? null,
+      complete,
+      allowCache: options.allowCache,
+      forceRefresh: options.forceRefresh,
+    });
+  }
+
+  function finalizeStreamingOutput(token: number, segmentIndex: number): void {
+    const run = requireRun();
+    if (token !== analysisGeneration || run.outputEmitted) {
+      return;
+    }
+    emitPhaseEnd(AnalysisPhase.OUTPUT, segmentIndex, {
+      audio: buildStreamingAudioSnapshot(),
+      cfp: run.cfpBatches,
+      inference: run.lastInferenceResult,
+    });
+    run.outputEmitted = true;
+  }
+
+  function buildStreamingAudioSnapshot(): { pcm: Float32Array; fs: number } {
+    const run = requireRun();
+    return {
+      pcm: concatFloat32Chunks(
+        run.streamingAudioChunks,
+        run.streamingAudioTotalSamples,
+      ),
+      fs: DEFAULT_TARGET_SAMPLE_RATE,
+    };
+  }
+
+  function appendStreamingAudio(run: AnalyzerRunState, segment: Float32Array): void {
+    run.streamingAudioChunks.push(segment);
+    run.streamingAudioTotalSamples += segment.length;
+  }
+
+  function normalizeStreamingChunk(
+    rawChunk: readonly Float32Array[],
+    sampleRate: number,
+  ): Float32Array {
+    const monoChunk = mixDownChannelsToMono(rawChunk);
+    return postProcessDecodedAudio({
+      decodedPcm: monoChunk,
+      sampleRate,
+      targetSampleRate: DEFAULT_TARGET_SAMPLE_RATE,
+    }).pcm;
+  }
+
+  function takeNextStreamingSegment({
+    queue,
+    streamEnded,
+    targetSegmentSamples,
+  }: {
+    queue: SampleQueue;
+    streamEnded: boolean;
+    targetSegmentSamples: number;
+  }): { segment: Float32Array | null; final: boolean } {
+    if (queue.totalSamples >= targetSegmentSamples) {
+      return {
+        segment: takeSamples(queue, targetSegmentSamples),
+        final: false,
+      };
+    }
+    if (streamEnded && queue.totalSamples > 0) {
+      const tail = drainSamples(queue);
+      return {
+        segment: padSamplesToLength(tail, targetSegmentSamples),
+        final: true,
+      };
+    }
+    return {
+      segment: null,
+      final: false,
+    };
+  }
+
+  async function runStreamingAnalysis(token: number): Promise<void> {
+    const run = requireRun();
+    const stream =
+      run.input.source.kind === "stream" ? run.input.source.stream : null;
+    if (!stream) {
+      return;
+    }
+    const isStreamingAborted = (): boolean =>
+      token !== analysisGeneration || run.execution.signal?.aborted === true;
+
+    streamingAnalysisActive = true;
+    const targetSegmentSamples = Math.max(
+      1,
+      Math.round(DEFAULT_TARGET_SAMPLE_RATE * analysisChunkSec),
+    );
+    run.streamingAudioChunks = [];
+    run.streamingAudioTotalSamples = 0;
+    const streamingSession = (() => {
+      const pendingSamples = createSampleQueue();
+      let streamEnded = false;
+      let streamingDrainPromise: Promise<void> = Promise.resolve();
+      let segmentIndex = 0;
+
+      async function processQueuedSegment(
+        segment: Float32Array,
+        final: boolean,
+      ): Promise<void> {
+        if (isStreamingAborted()) {
+          return;
+        }
+        appendStreamingAudio(run, segment);
+        await processStreamingSegment({
+          token,
+          segment,
+          index: segmentIndex,
+          final,
+        });
+        segmentIndex += 1;
+      }
+
+      async function drain(): Promise<void> {
+        while (!isStreamingAborted()) {
+          const next = takeNextStreamingSegment({
+            queue: pendingSamples,
+            streamEnded,
+            targetSegmentSamples,
+          });
+          if (!next.segment || !next.segment.length) {
+            break;
+          }
+
+          await processQueuedSegment(next.segment, next.final);
+          if (isStreamingAborted()) {
+            return;
+          }
+
+          if (next.final) {
+            streamEnded = true;
+            break;
+          }
+        }
+      }
+
+      function requestDrain(): void {
+        if (isStreamingAborted()) {
+          return;
+        }
+        streamingDrainPromise = streamingDrainPromise
+          .then(() => drain())
+          .catch((error) => {
+            if (isStreamingAborted()) {
+              return;
+            }
+            throw error;
+          });
+      }
+
+      return {
+        get segmentIndex(): number {
+          return segmentIndex;
+        },
+        scheduleChunk(
+          rawChunk: readonly Float32Array[],
+          sampleRate: number,
+        ): void {
+          if (isStreamingAborted()) {
+            return;
+          }
+          const resampled = normalizeStreamingChunk(rawChunk, sampleRate);
+          enqueueSamples(pendingSamples, resampled);
+          requestDrain();
+        },
+        async flushTail(): Promise<void> {
+          if (isStreamingAborted()) {
+            return;
+          }
+
+          streamEnded = true;
+          requestDrain();
+          await streamingDrainPromise.catch(() => undefined);
+        },
+      };
+    })();
+
+    emitPhaseEnd(AnalysisPhase.AUDIO, 0, {
+      audio: {
+        pcm: new Float32Array(0),
+        fs: DEFAULT_TARGET_SAMPLE_RATE,
+      },
+      reuseCFP: false,
+    });
+
+    try {
+      await captureAudioFromMediaStream(stream, {
+        signal: run.execution.signal ?? null,
+        onChunk: streamingSession.scheduleChunk,
+      });
+      if (isStreamingAborted()) {
+        return;
+      }
+      await streamingSession.flushTail();
+      if (isStreamingAborted()) {
+        return;
+      }
+      finalizeStreamingOutput(token, streamingSession.segmentIndex);
+    } finally {
+      streamingAnalysisActive = false;
+      streamingAnalysisPromise = null;
+    }
   }
 
   function setPhase(phase: AnalysisPhase): AnalysisContext {
@@ -329,7 +796,8 @@ export function createAnalyzer(
   }
 
   function emitOutputPhase(index: number): void {
-    if (outputEmitted) {
+    const run = requireRun();
+    if (run.outputEmitted) {
       return;
     }
     const audio = requireDecodedAudio();
@@ -339,10 +807,10 @@ export function createAnalyzer(
     setPhase(AnalysisPhase.OUTPUT);
     emitPhaseEnd(AnalysisPhase.OUTPUT, index, {
       audio: audioSnapshot,
-      cfp: currentCFPBatches,
-      inference: lastInferenceResult,
+      cfp: run.cfpBatches,
+      inference: run.lastInferenceResult,
     });
-    outputEmitted = true;
+    run.outputEmitted = true;
   }
 
   async function prepareAudioAndPlan(
@@ -363,15 +831,6 @@ export function createAnalyzer(
     context.state.analysisPlan = buildAnalysisPlan(
       decodedAudio.pcm.length,
       decodedAudio.fs,
-      {
-        adaptiveChunkSec: true,
-        steadyChunkSec: batchSec,
-        firstChunkSec: 0.8,
-        warmupChunkSec: 1.6,
-        warmupChunks: 2,
-        rampChunks: 3,
-      },
-      batchSec,
     );
 
     const analysisPlan = context.state.analysisPlan;
@@ -386,7 +845,7 @@ export function createAnalyzer(
       : { pcm: decodedAudio.pcm, fs: decodedAudio.fs };
     emitPhaseEnd(AnalysisPhase.AUDIO, 0, {
       audio: audioSnapshot,
-      reuseCFP: reuseCFPBatchesForCurrentRun,
+      reuseCFP: requireRun().reuseCFP,
     });
     analyzerLogger.info(`runtime analyzer prepared: ${analyzerLabel}`);
     if (analysisPlan.length === 0) {
@@ -398,11 +857,7 @@ export function createAnalyzer(
   }
 
   async function runStep(generation: number): Promise<void> {
-    const input = currentInput;
-    const execution = currentExecution;
-    if (!input || !execution) {
-      throw new Error("runtime input is unavailable");
-    }
+    const run = requireRun();
     if (generation !== analysisGeneration) {
       return;
     }
@@ -421,139 +876,51 @@ export function createAnalyzer(
       fs: decodedAudio.fs,
     };
 
-    let cfpResult:
-      | {
-          fileKey: string;
-          batches: readonly CFPBatch[];
-          allBatches: readonly CFPBatch[];
-          complete: boolean;
-        }
-      | null = null;
+    let cfpResult: AnalyzerCFPProcessResult | null = null;
 
-    if (reuseCFPBatchesForCurrentRun && stepIndex === 0 && currentCFPBatches.length > 0) {
+    if (run.reuseCFP && stepIndex === 0 && run.cfpBatches.length > 0) {
       cfpResult = {
-        fileKey: String(input.fileKey || input.source.label || "").trim(),
-        batches: currentCFPBatches,
-        allBatches: currentCFPBatches,
+        kind: "cache-hit",
+        fileKey: run.fileKey,
+        batches: run.cfpBatches,
         complete: true,
       };
       analyzerLogger.info(
-        `runtime analyzer reuse cfp batches: count=${currentCFPBatches.length}`,
+        `runtime analyzer reuse cfp batches: count=${run.cfpBatches.length}`,
       );
     } else {
       setPhase(AnalysisPhase.CFP);
-      cfpResult = await cfpManager.process({
-        input,
-        execution,
-        previousBatches: currentCFPBatches,
+      cfpResult = await processCFPSegment(
+        run,
         segment,
-        signal: execution.signal ?? null,
-        complete: isLastStep,
-      });
+        isLastStep,
+        {
+          allowCache: run.execution.allowCache !== false,
+          forceRefresh: run.execution.forceRefresh === true,
+        },
+      );
     }
 
     if (generation !== analysisGeneration) {
       return;
     }
 
-    currentCFPBatches = [...cfpResult.allBatches];
-    currentCFPComplete = cfpResult.complete === true;
     activeState.nextPlanIndex = cfpResult.complete
       ? plan.length
       : stepIndex + 1;
-    if (!(reuseCFPBatchesForCurrentRun && stepIndex === 0)) {
-      emitPhaseEnd(AnalysisPhase.CFP, stepIndex, {
-        cfp: cfpResult.batches,
-        allCfp: currentCFPBatches,
-        complete: cfpResult.complete,
-      });
-    }
     inferenceQueue = inferenceQueue
       .then(async () => {
         if (generation !== analysisGeneration) {
           return;
         }
-        setPhase(AnalysisPhase.INFERENCE);
-        const fileKey = String(input.fileKey || input.source.label || "").trim();
-        analyzerLogger.info(`runtime analyzer inference start: model=${input.model.name}`);
         const completeRun = isLastStep || cfpResult.complete;
-        let inferenceCacheHit = false;
-        const shouldProbeInferenceCache =
-          execution.allowCache !== false &&
-          execution.forceRefresh !== true &&
-          cfpResult.complete &&
-          cfpResult.batches.length > 1 &&
-          typeof inferenceManager.hasCache === "function" &&
-          fileKey.length > 0;
-
-        if (shouldProbeInferenceCache) {
-          try {
-            inferenceCacheHit = await inferenceManager.hasCache!(fileKey, input.model.name);
-          } catch {
-            inferenceCacheHit = false;
-          }
-        }
-
-        const shouldProgressiveReplay =
-          cfpResult.complete &&
-          cfpResult.batches.length > 1 &&
-          !inferenceCacheHit;
-
-        if (shouldProgressiveReplay) {
-          analyzerLogger.info(`runtime analyzer inference progressive replay: model=${input.model.name}`);
-          for (let batchIndex = 0; batchIndex < cfpResult.batches.length; batchIndex += 1) {
-            if (generation !== analysisGeneration) {
-              return;
-            }
-            const batch = cfpResult.batches[batchIndex];
-            if (!batch) {
-              continue;
-            }
-            const isLastBatch = batchIndex + 1 >= cfpResult.batches.length;
-            const inferenceResult = await inferenceManager.process({
-              batches: [batch],
-              modelName: input.model.name,
-              fileKey,
-              allowCache: execution.allowCache !== false,
-              forceRefresh: execution.forceRefresh === true,
-              complete: completeRun && isLastBatch,
-            });
-            if (generation !== analysisGeneration) {
-              return;
-            }
-            lastInferenceResult = inferenceResult;
-            emitPhaseEnd(AnalysisPhase.INFERENCE, stepIndex, {
-              cfp: [batch],
-              allCfp: currentCFPBatches,
-              inference: inferenceResult,
-            });
-          }
-          analyzerLogger.info(`runtime analyzer inference progressive replay done: model=${input.model.name}`);
-        } else {
-          const inferenceResult = await inferenceManager.process({
-            batches: cfpResult.batches,
-            modelName: input.model.name,
-            fileKey,
-            allowCache: execution.allowCache !== false,
-            forceRefresh: execution.forceRefresh === true,
-            complete: completeRun,
-          });
-          if (generation !== analysisGeneration) {
-            return;
-          }
-          lastInferenceResult = inferenceResult;
-          analyzerLogger.info(`runtime analyzer inference done: model=${input.model.name}`);
-          emitPhaseEnd(AnalysisPhase.INFERENCE, stepIndex, {
-            cfp: cfpResult.batches,
-            allCfp: currentCFPBatches,
-            inference: inferenceResult,
-          });
-        }
-        if (completeRun) {
-          emitOutputPhase(plan.length);
-        } else {
-          setPhase(AnalysisPhase.CFP);
-        }
+        await applyCFPAndRunInference({
+          generation,
+          stepIndex,
+          result: cfpResult,
+          completeRun,
+          emitCFP: !(run.reuseCFP && stepIndex === 0),
+        });
       })
       .then(
         () => undefined,
@@ -572,9 +939,26 @@ export function createAnalyzer(
       input: AnalyzeInput,
       execution: AnalyzeExecutionOptions = {},
     ): Promise<void> {
-      await prepareAudioAndPlan(input, execution);
+      if (input.source.kind === "stream") {
+        resetActiveState(input, execution);
+        const token = analysisGeneration;
+        streamingAnalysisPromise = runStreamingAnalysis(token)
+          .then(() => undefined)
+          .catch((error) => {
+            if (token !== analysisGeneration) {
+              return;
+            }
+            throw error;
+          });
+        await streamingAnalysisPromise;
+      } else {
+        await prepareAudioAndPlan(input, execution);
+      }
     },
     step(): Promise<void> {
+      if (streamingAnalysisActive || streamingAnalysisPromise) {
+        return Promise.resolve();
+      }
       const generation = analysisGeneration;
       const next = stepQueue.then(() => runStep(generation));
       stepQueue = next.then(

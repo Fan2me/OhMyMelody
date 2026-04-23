@@ -1,10 +1,10 @@
-import type { CFPBatch } from "@ohm/core/cache/cache.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import {
-  buildPredictionCacheKey,
-  CFPIndexedDBCache,
   normalizePredictionCacheEntry,
+  PredictionIndexedDBCache,
   type PredictionCacheEntry,
-} from "@ohm/core/cache/cache.js";
+} from "@ohm/core/cache/prediction.js";
+import { CORE_INFERENCE_WORKER_MODULE_URL } from "@ohm/core/inference/inference.js";
 import { getModuleLogger } from "@ohm/core/logging/logger.js";
 import {
   normalizeCoreModelName,
@@ -14,10 +14,7 @@ import type { WorkerLike } from "@ohm/core/cfp/types.js";
 import type { InferenceProgress, InferenceResult } from "../analysis.js";
 
 const inferenceLogger = getModuleLogger("core.runtime.inference");
-const defaultWorkerScriptUrl = new URL(
-  "../../../core/dist/inference/worker.js",
-  import.meta.url,
-).toString();
+const defaultWorkerScriptUrl = CORE_INFERENCE_WORKER_MODULE_URL;
 
 type InferenceWorkerInitMessage = {
   cmd: "init";
@@ -66,6 +63,29 @@ type PendingPromise = {
   reject: (reason?: unknown) => void;
 };
 
+type WorkerState = {
+  worker: WorkerLike | null;
+  readyPromise: Promise<WorkerLike | null> | null;
+  initializedModelName: string;
+  provider: string;
+};
+
+type SessionState = {
+  modelName: string;
+  id: number;
+  useCachedResult: boolean;
+  result: InferenceResult;
+};
+
+type InferenceProcessInput = {
+  batches: readonly CFPBatch[];
+  modelName: string;
+  fileKey?: string;
+  allowCache?: boolean;
+  forceRefresh?: boolean;
+  complete?: boolean;
+};
+
 function buildEmptyInferenceResult(): InferenceResult {
   return {
     totalArgmax: [],
@@ -83,6 +103,18 @@ function mergeInferenceResults(
   };
 }
 
+function buildInferenceCacheKey(
+  fileKey: string,
+  modelName: string,
+  backend = "runtime-inference-v3",
+): string {
+  return [
+    String(fileKey || "").trim(),
+    normalizeCoreModelName(modelName),
+    String(backend || "").trim(),
+  ].join("::");
+}
+
 export interface InferenceManagerOptions {
   onProgress?: ((progress: InferenceProgress) => void) | null;
   workerModuleUrl?: string | URL;
@@ -91,16 +123,19 @@ export interface InferenceManagerOptions {
 export class InferenceManager {
   private readonly workerModuleUrl: string | URL;
   private readonly options: InferenceManagerOptions;
-  private readonly cache: CFPIndexedDBCache;
-  private residentWorker: WorkerLike | null = null;
-  private workerReadyPromise: Promise<WorkerLike | null> | null = null;
-  private workerInitialized = false;
-  private currentModelName = "";
-  private currentProvider = "";
-  private sessionModelName = "";
-  private sessionId = 0;
-  private useCachedResult = false;
-  private result: InferenceResult = buildEmptyInferenceResult();
+  private readonly cache: PredictionIndexedDBCache;
+  private readonly workerState: WorkerState = {
+    worker: null,
+    readyPromise: null,
+    initializedModelName: "",
+    provider: "",
+  };
+  private readonly sessionState: SessionState = {
+    modelName: "",
+    id: 0,
+    useCachedResult: false,
+    result: buildEmptyInferenceResult(),
+  };
   private pending = new Map<string, PendingPromise>();
   private nextId = 1;
   private processQueue: Promise<void> = Promise.resolve();
@@ -109,17 +144,15 @@ export class InferenceManager {
   constructor(options: InferenceManagerOptions = {}) {
     this.options = options;
     this.workerModuleUrl = options.workerModuleUrl ?? defaultWorkerScriptUrl;
-    this.cache = new CFPIndexedDBCache({
-      normalizeCFPBatches: () => [],
-    });
+    this.cache = new PredictionIndexedDBCache();
+  }
+
+  private get sessionLabel(): string {
+    return `session=${this.sessionState.id}`;
   }
 
   private buildInferenceCacheKey(fileKey: string, modelName: string): string {
-    return buildPredictionCacheKey({
-      fileKey,
-      modelName: normalizeCoreModelName(modelName),
-      backend: "runtime-inference-v2",
-    });
+    return buildInferenceCacheKey(fileKey, modelName);
   }
 
   private toInferenceResultFromCache(entry: PredictionCacheEntry): InferenceResult {
@@ -185,11 +218,11 @@ export class InferenceManager {
     worker.onmessage = (ev: MessageEvent<InferenceWorkerMessage>) => {
       const message = ev.data || ({} as InferenceWorkerMessage);
       if (message.cmd === "inited") {
-        this.currentProvider = message.provider || this.currentProvider || "unknown";
+        this.workerState.provider =
+          message.provider || this.workerState.provider || "unknown";
         inferenceLogger.info(
-          `runtime inference worker inited: model=${this.currentModelName || "unknown"} provider=${this.currentProvider || "unknown"}`,
+          `runtime inference worker inited: model=${this.workerState.initializedModelName || "unknown"} provider=${this.workerState.provider || "unknown"}`,
         );
-        this.workerInitialized = true;
         return;
       }
       if (message.cmd === "result") {
@@ -216,38 +249,42 @@ export class InferenceManager {
       }
     };
     worker.onerror = () => {
-      for (const [id, pending] of this.pending.entries()) {
-        this.pending.delete(id);
-        pending.reject(new Error("Inference worker runtime error"));
-      }
-      this.workerInitialized = false;
+      this.rejectAllPending(new Error("Inference worker runtime error"));
+      this.workerState.initializedModelName = "";
     };
   }
 
-  private async ensureWorker(): Promise<WorkerLike | null> {
-    if (this.residentWorker) {
-      return this.residentWorker;
+  private rejectAllPending(error: unknown): void {
+    for (const [id, pending] of this.pending.entries()) {
+      this.pending.delete(id);
+      pending.reject(error);
     }
-    if (this.workerReadyPromise) {
-      return await this.workerReadyPromise;
+  }
+
+  private async ensureWorker(): Promise<WorkerLike | null> {
+    if (this.workerState.worker) {
+      return this.workerState.worker;
+    }
+    if (this.workerState.readyPromise) {
+      return await this.workerState.readyPromise;
     }
 
-    this.workerReadyPromise = (async () => {
+    this.workerState.readyPromise = (async () => {
       const worker = this.createWorkerInstance();
       if (!worker) {
         return null;
       }
       this.attachWorkerHandlers(worker);
-      this.residentWorker = worker;
+      this.workerState.worker = worker;
       inferenceLogger.info(
         `runtime inference worker created: ${String(this.workerModuleUrl)}`,
       );
       return worker;
     })().finally(() => {
-      this.workerReadyPromise = null;
+      this.workerState.readyPromise = null;
     });
 
-    return await this.workerReadyPromise;
+    return await this.workerState.readyPromise;
   }
 
   private async ensureInitialized(modelName: string): Promise<WorkerLike | null> {
@@ -257,7 +294,7 @@ export class InferenceManager {
     }
 
     const safeModelName = normalizeCoreModelName(modelName);
-    if (this.workerInitialized && this.currentModelName === safeModelName) {
+    if (this.workerState.initializedModelName === safeModelName) {
       inferenceLogger.info(
         `runtime inference worker reuse initialized model=${safeModelName}`,
       );
@@ -318,12 +355,26 @@ export class InferenceManager {
       }
     });
 
-    this.currentModelName = safeModelName;
-    this.workerInitialized = true;
+    this.workerState.initializedModelName = safeModelName;
     inferenceLogger.info(
       `runtime inference worker init done: model=${safeModelName}`,
     );
     return worker;
+  }
+
+  private async postWorkerRequest(
+    worker: NonNullable<WorkerLike>,
+    message: InferenceWorkerProcessMessage,
+  ): Promise<InferenceResult> {
+    return await new Promise<InferenceResult>((resolve, reject) => {
+      this.pending.set(message.id, { resolve, reject });
+      try {
+        worker.postMessage(message);
+      } catch (error) {
+        this.pending.delete(message.id);
+        reject(error);
+      }
+    });
   }
 
   private async sendReset(): Promise<void> {
@@ -344,16 +395,103 @@ export class InferenceManager {
     return next;
   }
 
+  private resetSessionState(nextModelName = ""): void {
+    this.sessionState.modelName = nextModelName;
+    this.sessionState.id += 1;
+    this.sessionState.useCachedResult = false;
+    this.sessionState.result = buildEmptyInferenceResult();
+  }
+
   private async startNewSession(modelName: string, reason: string): Promise<void> {
-    const previousModel = this.sessionModelName || "none";
-    this.sessionId += 1;
-    this.sessionModelName = modelName;
-    this.useCachedResult = false;
-    this.result = buildEmptyInferenceResult();
+    const previousModel = this.sessionState.modelName || "none";
+    this.resetSessionState(modelName);
     await this.sendReset();
     inferenceLogger.info(
-      `runtime inference session started: session=${this.sessionId} reason=${reason} prevModel=${previousModel} model=${modelName}`,
+      `runtime inference session started: session=${this.sessionState.id} reason=${reason} prevModel=${previousModel} model=${modelName}`,
     );
+  }
+
+  private async ensureSession(modelName: string): Promise<string> {
+    const safeModelName = normalizeCoreModelName(modelName);
+    if (!this.sessionState.modelName) {
+      await this.startNewSession(safeModelName, "initial");
+    } else if (this.sessionState.modelName !== safeModelName) {
+      await this.startNewSession(safeModelName, "model-changed");
+    }
+    return safeModelName;
+  }
+
+  private resolveCacheKey(
+    fileKey: string | undefined,
+    modelName: string,
+    allowCache: boolean,
+  ): string {
+    if (allowCache === false || typeof fileKey !== "string" || !fileKey.trim()) {
+      return "";
+    }
+    return this.buildInferenceCacheKey(String(fileKey), modelName);
+  }
+
+  private async tryReadCachedResult(
+    cacheKey: string,
+    forceRefresh: boolean,
+  ): Promise<InferenceResult | null> {
+    if (
+      !cacheKey ||
+      forceRefresh === true ||
+      this.sessionState.result.totalArgmax.length > 0
+    ) {
+      return null;
+    }
+    if (
+      this.sessionState.useCachedResult &&
+      this.sessionState.result.totalArgmax.length > 0
+    ) {
+      return this.sessionState.result;
+    }
+
+    try {
+      const cachedRaw = await this.cache.getPredictionCache(cacheKey);
+      const cached = normalizePredictionCacheEntry(cachedRaw);
+      if (cached && this.isCacheEntryUsable(cached)) {
+        const hit = this.toInferenceResultFromCache(cached);
+        this.sessionState.result = hit;
+        this.sessionState.useCachedResult = true;
+        inferenceLogger.info(`runtime inference cache hit: key=${cacheKey}`);
+        return hit;
+      }
+      if (cached && !this.isCacheEntryUsable(cached)) {
+        inferenceLogger.warn(
+          `runtime inference cache ignored: key=${cacheKey} reason=invalid-cache-entry`,
+        );
+      }
+    } catch (error) {
+      inferenceLogger.warn(
+        `runtime inference cache read failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return null;
+  }
+
+  private async writeCachedResult(
+    cacheKey: string,
+    complete: boolean,
+    result: InferenceResult,
+  ): Promise<void> {
+    if (!cacheKey || complete !== true) {
+      return;
+    }
+    try {
+      await this.cache.setPredictionCache(
+        cacheKey,
+        this.toPredictionCacheEntry(result),
+      );
+      inferenceLogger.info(`runtime inference cache written: key=${cacheKey}`);
+    } catch (error) {
+      inferenceLogger.warn(
+        `runtime inference cache write failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async process({
@@ -363,55 +501,20 @@ export class InferenceManager {
     allowCache = true,
     forceRefresh = false,
     complete = false,
-  }: {
-    batches: readonly CFPBatch[];
-    modelName: string;
-    fileKey?: string;
-    allowCache?: boolean;
-    forceRefresh?: boolean;
-    complete?: boolean;
-  }): Promise<InferenceResult> {
+  }: InferenceProcessInput): Promise<InferenceResult> {
     return await this.enqueue(async () => {
-      const safeModelName = normalizeCoreModelName(modelName);
-      if (!this.sessionModelName) {
-        await this.startNewSession(safeModelName, "initial");
-      } else if (this.sessionModelName !== safeModelName) {
-        await this.startNewSession(safeModelName, "model-changed");
-      }
+      const safeModelName = await this.ensureSession(modelName);
       inferenceLogger.info(
-        `runtime inference process start: session=${this.sessionId} model=${safeModelName} provider=${this.currentProvider || "unknown"} batches=${batches.length}`,
+        `runtime inference process start: session=${this.sessionState.id} model=${safeModelName} provider=${this.workerState.provider || "unknown"} batches=${batches.length}`,
       );
       if (!batches.length) {
-        return this.result;
+        return this.sessionState.result;
       }
 
-      const canUseCache =
-        allowCache !== false &&
-        typeof fileKey === "string" &&
-        fileKey.trim().length > 0;
-      const cacheKey = canUseCache ? this.buildInferenceCacheKey(String(fileKey), safeModelName) : "";
-      if (this.useCachedResult && this.result.totalArgmax.length > 0) {
-        return this.result;
-      }
-      if (canUseCache && cacheKey && forceRefresh !== true && this.result.totalArgmax.length <= 0) {
-        try {
-          const cachedRaw = await this.cache.getPredictionCache(cacheKey);
-          const cached = normalizePredictionCacheEntry(cachedRaw);
-          if (cached && this.isCacheEntryUsable(cached)) {
-            const hit = this.toInferenceResultFromCache(cached);
-            this.result = hit;
-            this.useCachedResult = true;
-            inferenceLogger.info(`runtime inference cache hit: key=${cacheKey}`);
-            return hit;
-          }
-          if (cached && !this.isCacheEntryUsable(cached)) {
-            inferenceLogger.warn(`runtime inference cache ignored: key=${cacheKey} reason=invalid-cache-entry`);
-          }
-        } catch (error) {
-          inferenceLogger.warn(
-            `runtime inference cache read failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
+      const cacheKey = this.resolveCacheKey(fileKey, safeModelName, allowCache);
+      const cachedResult = await this.tryReadCachedResult(cacheKey, forceRefresh);
+      if (cachedResult) {
+        return cachedResult;
       }
 
       const worker = await this.ensureInitialized(modelName);
@@ -421,35 +524,23 @@ export class InferenceManager {
 
       const id = String(this.nextId++);
       inferenceLogger.info(
-        `runtime inference worker process begin: session=${this.sessionId} id=${id} model=${safeModelName} provider=${this.currentProvider || "unknown"} batches=${batches.length}`,
+        `runtime inference worker process begin: session=${this.sessionState.id} id=${id} model=${safeModelName} provider=${this.workerState.provider || "unknown"} batches=${batches.length}`,
       );
-      const resultPromise = new Promise<InferenceResult>((resolve, reject) => {
-        this.pending.set(id, { resolve, reject });
-      });
-
-      worker.postMessage({
+      const result = await this.postWorkerRequest(worker, {
         cmd: "process",
         id,
         modelName: safeModelName,
         batches,
       } satisfies InferenceWorkerProcessMessage);
-
-      const result = await resultPromise;
-      this.useCachedResult = false;
-      this.result = mergeInferenceResults(this.result, result);
-      const mergedResult = this.result;
-      if (canUseCache && cacheKey && complete === true) {
-        try {
-          await this.cache.setPredictionCache(cacheKey, this.toPredictionCacheEntry(mergedResult));
-          inferenceLogger.info(`runtime inference cache written: key=${cacheKey}`);
-        } catch (error) {
-          inferenceLogger.warn(
-            `runtime inference cache write failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
+      this.sessionState.useCachedResult = false;
+      this.sessionState.result = mergeInferenceResults(
+        this.sessionState.result,
+        result,
+      );
+      const mergedResult = this.sessionState.result;
+      await this.writeCachedResult(cacheKey, complete, mergedResult);
       inferenceLogger.info(
-        `runtime inference worker process done: session=${this.sessionId} id=${id} model=${safeModelName} provider=${this.currentProvider || "unknown"}`,
+        `runtime inference worker process done: session=${this.sessionState.id} id=${id} model=${safeModelName} provider=${this.workerState.provider || "unknown"}`,
       );
       return mergedResult;
     });
@@ -461,10 +552,7 @@ export class InferenceManager {
 
   reset(): void {
     void this.enqueue(async () => {
-      this.sessionModelName = "";
-      this.sessionId += 1;
-      this.useCachedResult = false;
-      this.result = buildEmptyInferenceResult();
+      this.resetSessionState();
       await this.sendReset();
     });
   }
