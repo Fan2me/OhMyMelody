@@ -7,7 +7,6 @@ import { createSpectrumUi } from "@ohm/ui";
 import type { RepresentativeMode } from "@ohm/ui";
 
 const modelNameSelect = document.getElementById("modelName") as HTMLSelectElement | null;
-const audioSourceSelect = document.getElementById("audioSourceSelect") as HTMLSelectElement | null;
 const usePredictionCacheCheckbox = document.getElementById("usePredictionCacheCheckbox") as HTMLInputElement | null;
 const audioFileInput = document.getElementById("audioFile") as HTMLInputElement | null;
 const startMicRecordBtn = document.getElementById("startMicRecordBtn") as HTMLButtonElement | null;
@@ -41,30 +40,23 @@ const uiStatus = document.getElementById("uiStatus") as HTMLElement | null;
 const fileDropHint = document.getElementById("fileDropHint") as HTMLElement | null;
 
 const analyzer = createAnalyzer(
-  import.meta.env.PROD
-    ? {
-        cfpManager: new CFPManager({
-          createWorkerInstance: () =>
-            new Worker(
-              new URL("../../packages/core/src/cfp/worker.js?worker&inline", import.meta.url),
-              { type: "module" },
-            ),
-          cfpScriptUrl: new URL("../../packages/core/cfp.py", import.meta.url).toString(),
-        }),
-      }
-    : {},
+  {
+    cfpManager: new CFPManager({
+      // Keep worker creation in the app entry so Vite can transform the worker
+      // URL correctly in both dev server and production build.
+      createWorkerInstance: () =>
+        new Worker(
+          new URL("../../packages/core/src/cfp/worker.ts", import.meta.url),
+          { type: "module" },
+        ),
+      cfpScriptUrl: new URL("../../packages/core/cfp.py", import.meta.url).toString(),
+    }),
+  },
 );
 const ui = createSpectrumUi({
   analyzer,
   mount: spectrumCanvasWrapper,
   audioElement: audioPlayer,
-  heatmapWorkerFactory: import.meta.env.PROD
-    ? () =>
-        new Worker(
-          new URL("../../packages/ui/src/heatmap-render-worker.js?worker", import.meta.url),
-          { type: "module" },
-        )
-    : null,
   sections: {
     main: { enabled: true, overlay: true, fps: 60, overlayFps: 60 },
     overview: { enabled: true, overlay: true, fps: 24, overlayFps: 24 },
@@ -80,7 +72,6 @@ const SETTINGS_KEY = "ohmymelody.app.settings.v1";
 
 type AppSettings = {
   modelName?: string;
-  audioSource?: string;
   usePredictionCache?: boolean;
   audioPlaybackRate?: number;
   abLoop?: {
@@ -106,6 +97,8 @@ type AppSettings = {
 
 let mediaStream: MediaStream | null = null;
 let mediaRecorder: MediaRecorder | null = null;
+let micAnalysisAbortController: AbortController | null = null;
+let micAnalysisStopRequested = false;
 let micChunks: BlobPart[] = [];
 let recordedMicFile: File | null = null;
 let lastAnalyzedFile: File | null = null;
@@ -116,6 +109,8 @@ let playbackRate = 1;
 let abLoopStartTime: number | null = null;
 let abLoopEndTime: number | null = null;
 let abLoopEnabledState = false;
+type MicAnalysisState = "idle" | "running" | "stopping";
+let micLiveAnalysisState: MicAnalysisState = "idle";
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const BINS_PER_SEMITONE = 5;
 const MIN_PITCH_NOTE = "C1";
@@ -142,6 +137,19 @@ function formatAudioTime(seconds: number | null | undefined): string {
 
 function formatPlaybackRate(rate: number): string {
   return `${clampNumber(Number(rate) || 1, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE).toFixed(2)}x`;
+}
+
+function setMicLiveAnalysisState(nextState: MicAnalysisState): void {
+  micLiveAnalysisState = nextState;
+  syncMicButtons();
+}
+
+function beginMicLiveAnalysis(): void {
+  setMicLiveAnalysisState("running");
+}
+
+function resetMicLiveAnalysisState(): void {
+  setMicLiveAnalysisState("idle");
 }
 
 function getSpectrumStrideForZoom({
@@ -245,7 +253,7 @@ function formatDebugStateBlock(): string {
     `sampling-spectrum: stride=${spectrumStride} frames (~${spectrumUps} UPS @100Hz)`,
     `viewport: total=${debugState.viewport.totalFrames} view=${debugState.viewport.viewFrames} offset=${formatDebugNumber(debugState.viewport.offsetFrames, 2)} zoom=${formatDebugNumber(debugState.viewport.zoom, 3)}`,
     `draw-matrix: rows(pitchBins)=${displayRows} cols(sampledFrames)=${sampledColsByUps} sourceViewFrames=${viewCols} totalFrames=${totalCols}`,
-    `prediction: inferenceVisible=${debugState.prediction.inferenceVisibleCount} inferenceTotal=${debugState.prediction.inferenceTotalCount}`,
+    `prediction: frameCount=${debugState.prediction.frameCount} inferenceTotal=${debugState.prediction.inferenceTotalCount}`,
     `hover: frame=${debugState.hover.frame} bin=${formatDebugNumber(debugState.hover.frameBin, 2)} dx=${formatDebugNumber(deltaX, 2)} dy=${formatDebugNumber(deltaY, 2)}`,
   ].join("\n");
 }
@@ -563,22 +571,6 @@ function setDropHint(active: boolean): void {
   fileDropHint.setAttribute("aria-hidden", active ? "false" : "true");
 }
 
-function ensureUploadAudioSource(): void {
-  if (!audioSourceSelect) return;
-  if (audioSourceSelect.value !== "upload") {
-    audioSourceSelect.value = "upload";
-    audioSourceSelect.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-}
-
-function ensureMicAudioSource(): void {
-  if (!audioSourceSelect) return;
-  if (audioSourceSelect.value !== "mic") {
-    audioSourceSelect.value = "mic";
-    audioSourceSelect.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-}
-
 function revokeCurrentAudioUrl(): void {
   if (!currentAudioObjectUrl) return;
   try {
@@ -775,6 +767,24 @@ function buildAnalyzeInput(file: File): {
   };
 }
 
+function buildAnalyzeStreamInput(stream: MediaStream): {
+  source: { kind: "stream"; stream: MediaStream; label: string };
+  model: { name: string };
+  fileKey: string;
+} {
+  return {
+    source: {
+      kind: "stream",
+      stream,
+      label: "mic-live",
+    },
+    model: {
+      name: readSelectedModelName(),
+    },
+    fileKey: "mic-live",
+  };
+}
+
 function updateStateFromUi(): void {
   if (uiStatus) {
     syncUiStatus(ui.getState().status);
@@ -787,10 +797,10 @@ function syncMicButtons(): void {
     startMicRecordBtn.disabled = recording;
   }
   if (stopMicRecordBtn) {
-    stopMicRecordBtn.disabled = !recording;
+    stopMicRecordBtn.disabled = !recording || micLiveAnalysisState === "idle";
   }
   if (exportMicRecordBtn) {
-    exportMicRecordBtn.disabled = !recordedMicFile;
+    exportMicRecordBtn.disabled = recording || !recordedMicFile;
   }
   if (micRecordStatus) {
     micRecordStatus.textContent = recording
@@ -812,9 +822,38 @@ function setRecordedMicFile(file: File | null): void {
     syncAbLoopUi();
   }
   syncMicButtons();
-  if (file) {
+  if (file && micLiveAnalysisState === "idle") {
     void analyzeCurrentAudio(file);
   }
+}
+
+function analyzeCurrentStream(stream: MediaStream): void {
+  if (micAnalysisStopRequested) {
+    log("麦克风流式分析已停止");
+    return;
+  }
+  micAnalysisAbortController?.abort("麦克风流式分析已重启");
+  micAnalysisAbortController = new AbortController();
+  beginMicLiveAnalysis();
+  void ui
+    .analyze({
+      input: buildAnalyzeStreamInput(stream),
+      execution: {
+        allowCache: false,
+        forceRefresh: true,
+        signal: micAnalysisAbortController.signal,
+      },
+    })
+    .then(() => {
+      log("流式分析完成");
+    })
+    .catch((error) => {
+      log(`流式分析失败: ${error instanceof Error ? error.message : String(error)}`);
+    })
+    .finally(() => {
+      micAnalysisAbortController = null;
+      resetMicLiveAnalysisState();
+    });
 }
 
 async function startMicRecording(): Promise<void> {
@@ -828,6 +867,7 @@ async function startMicRecording(): Promise<void> {
 
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    micAnalysisStopRequested = false;
     micChunks = [];
     const recorder = new MediaRecorder(mediaStream);
     mediaRecorder = recorder;
@@ -847,7 +887,7 @@ async function startMicRecording(): Promise<void> {
       syncMicButtons();
     };
     recorder.start();
-    ensureMicAudioSource();
+    analyzeCurrentStream(mediaStream);
     syncMicButtons();
     log("开始麦克风录制");
   } catch (error) {
@@ -857,6 +897,9 @@ async function startMicRecording(): Promise<void> {
 }
 
 function stopMicRecording(): void {
+  micAnalysisStopRequested = true;
+  ui.cancel("麦克风录音已停止");
+  micAnalysisAbortController?.abort("麦克风录音已停止");
   if (mediaRecorder && mediaRecorder.state === "recording") {
     mediaRecorder.stop();
   }
@@ -867,6 +910,11 @@ function stopMicRecording(): void {
       } catch {}
     }
     mediaStream = null;
+  }
+  if (micLiveAnalysisState === "running") {
+    setMicLiveAnalysisState("stopping");
+  } else {
+    resetMicLiveAnalysisState();
   }
   syncMicButtons();
 }
@@ -907,11 +955,11 @@ ui.subscribe((state) => {
     log(`CFP 已更新: batches=${state.cfp.length}`);
   }
 
-  const inferenceCount = state.inference ? state.inference.totalBatchCount : 0;
+  const inferenceCount = state.inference ? state.inference.totalArgmax.length : 0;
   if (inferenceCount !== previousInferenceCount) {
     previousInferenceCount = inferenceCount;
     if (state.inference) {
-      log(`推理已更新: batchCount=${state.inference.totalBatchCount}`);
+      log(`推理已更新: batchCount=${state.inference.totalArgmax.length}`);
     }
   }
 
@@ -929,9 +977,6 @@ populateModels();
 populatePitchRangeOptions();
 if (modelNameSelect && savedSettings.modelName) {
   modelNameSelect.value = savedSettings.modelName;
-}
-if (audioSourceSelect && savedSettings.audioSource) {
-  audioSourceSelect.value = savedSettings.audioSource;
 }
 if (usePredictionCacheCheckbox && typeof savedSettings.usePredictionCache === "boolean") {
   usePredictionCacheCheckbox.checked = savedSettings.usePredictionCache;
@@ -987,9 +1032,6 @@ if (Number.isFinite(savedAbLoop.end)) {
 }
 if (modelNameSelect) {
   saveAppSettings({ modelName: readSelectedModelName() });
-}
-if (audioSourceSelect) {
-  saveAppSettings({ audioSource: audioSourceSelect.value });
 }
 if (usePredictionCacheCheckbox) {
   saveAppSettings({ usePredictionCache: usePredictionCacheCheckbox.checked });
@@ -1098,17 +1140,6 @@ if (debugPanelEnabled) {
     }
   });
 }
-if (audioSourceSelect) {
-  audioSourceSelect.addEventListener("change", () => {
-    saveAppSettings({ audioSource: audioSourceSelect.value });
-    if (audioSourceSelect.value === "mic") {
-      log("已切换到麦克风模式");
-    } else {
-      log("已切换到上传文件模式");
-    }
-  });
-}
-
 if (playbackRateSlider) {
   playbackRateSlider.addEventListener("input", () => {
     applyPlaybackRate(Number(playbackRateSlider.value), true);
@@ -1147,7 +1178,6 @@ if (audioFileInput) {
     if (!file) {
       return;
     }
-    ensureUploadAudioSource();
     void analyzeCurrentAudio(file);
   });
 }
@@ -1181,7 +1211,6 @@ document.addEventListener("keydown", handleGlobalKeyDown);
 function handleDrop(files: File[]): void {
   const file = files[0] || null;
   if (!file) return;
-  ensureUploadAudioSource();
   if (audioFileInput) {
     const dt = new DataTransfer();
     dt.items.add(file);
