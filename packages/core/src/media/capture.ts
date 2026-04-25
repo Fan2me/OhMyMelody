@@ -21,7 +21,7 @@ export interface ResolvedMediaCaptureAudioContext {
 
 export interface MediaCaptureSource<
   TResult = unknown,
-  TOptions extends MediaCaptureContextOptions = MediaCaptureContextOptions,
+  _TOptions extends MediaCaptureContextOptions = MediaCaptureContextOptions,
 > {
   start: (
     finish: (error: Error | null, result?: TResult) => void,

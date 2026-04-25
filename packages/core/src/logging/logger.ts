@@ -1,5 +1,9 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+declare global {
+  var __OHM_ENABLE_CONSOLE_LOGS: boolean | undefined;
+}
+
 export interface LogEntry {
   id: string;
   module: string;
@@ -49,7 +53,9 @@ const LOG_LEVELS: readonly LogLevel[] = Object.freeze([
   "error",
 ]);
 
-let rootLoggerInstance: StructuredLogger = getLogger(console, {
+const defaultConsoleLogger = createConsoleGate(console);
+
+let rootLoggerInstance: StructuredLogger = getLogger(defaultConsoleLogger, {
   module: "root",
 });
 const moduleLoggerCache = new Map<string, StructuredLogger>();
@@ -119,6 +125,30 @@ function toConsoleMethod(
   return typeof candidate[method] === "function"
     ? (candidate[method] as (...args: unknown[]) => void)
     : null;
+}
+
+function isDefaultConsoleLoggingEnabled(): boolean {
+  return globalThis.__OHM_ENABLE_CONSOLE_LOGS === true;
+}
+
+function createConsoleGate(
+  target: Pick<Console, "log" | "info" | "warn" | "error" | "debug">,
+): Pick<Console, "log" | "info" | "warn" | "error" | "debug"> {
+  const forward =
+    (method: "log" | "info" | "warn" | "error" | "debug") =>
+    (...args: unknown[]) => {
+      if (!isDefaultConsoleLoggingEnabled()) {
+        return;
+      }
+      target[method](...args);
+    };
+  return {
+    log: forward("log"),
+    info: forward("info"),
+    warn: forward("warn"),
+    error: forward("error"),
+    debug: forward("debug"),
+  };
 }
 
 function createEntry(

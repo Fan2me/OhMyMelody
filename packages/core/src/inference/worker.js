@@ -11,7 +11,6 @@ const MODEL_NAMES = [
   "mftfa_b.onnx",
   "msnet.onnx",
 ];
-let currentResult = buildEmptyInferenceResult();
 const MODEL_URL_BASE = new URL("../../models/", import.meta.url);
 const MODEL_IO = Object.freeze({
   BATCH: 1,
@@ -45,13 +44,6 @@ function logWarn(message, payload) {
     return;
   }
   console.warn(`${INFERENCE_LOG_PREFIX} ${message}`);
-}
-
-function buildEmptyInferenceResult() {
-  return {
-    totalArgmax: [],
-    totalConfidence: [],
-  };
 }
 
 function normalizeCoreModelName(value) {
@@ -352,13 +344,6 @@ function createResultFromSegments(inputName, batches) {
   })();
 }
 
-function getModelUrl(modelName) {
-  return new URL(
-    encodeURIComponent(normalizeCoreModelName(modelName)),
-    MODEL_URL_BASE,
-  ).toString();
-}
-
 async function logModelFetchSnapshot(modelUrl) {
   try {
     const response = await fetch(modelUrl, { cache: "no-store" });
@@ -495,7 +480,6 @@ self.onmessage = async (ev) => {
           : ortWasmBaseUrl;
 
       currentModelName = normalizeCoreModelName(m.modelName);
-      currentResult = buildEmptyInferenceResult();
       const modelUrl = normalizeModelUrl(m.modelName, m.modelUrl);
       await logModelFetchSnapshot(modelUrl);
       const resolved = await createPrioritySession(modelUrl);
@@ -513,7 +497,6 @@ self.onmessage = async (ev) => {
           `worker process begin: id=${id} model=${currentModelName || "unknown"} batches=${batches.length}`,
         );
         const result = await createResultFromSegments(inputName, batches);
-        currentResult = result;
         logInfo(`worker process done: id=${id} model=${currentModelName || "unknown"}`);
         self.postMessage({ cmd: "result", id, result });
         return;
@@ -555,7 +538,6 @@ self.onmessage = async (ev) => {
         totalArgmax: batchArgmax.slice(),
         totalConfidence: batchConfidence.slice(),
       };
-      currentResult = result;
       self.postMessage({ cmd: "result", id, result });
     }
   } catch (err) {
