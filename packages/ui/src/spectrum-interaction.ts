@@ -87,6 +87,7 @@ export function createSpectrumInteractionController(
     if (!canvas) return;
     const targetCanvas: HTMLCanvasElement = canvas;
     targetCanvas.style.touchAction = "none";
+    targetCanvas.style.cursor = "default";
     const windowWithPointer = windowRef as (Window & { PointerEvent?: typeof PointerEvent }) | null;
     const hasPointerEvents = !!windowWithPointer && typeof windowWithPointer.PointerEvent === "function";
     const activePointers = new Map<number, { clientX: number; clientY: number }>();
@@ -129,6 +130,12 @@ export function createSpectrumInteractionController(
         spectrumHoverX: null,
         spectrumHoverY: null,
       });
+      updateMainCursor();
+    };
+
+    const updateMainCursor = () => {
+      const state = getState();
+      targetCanvas.style.cursor = state.spectrumDragging ? "grabbing" : "default";
     };
 
     const clearOverviewInteractionState = () => {
@@ -315,6 +322,7 @@ export function createSpectrumInteractionController(
       });
       markAutoPanSuppressed();
       markHoverFromEvent(e);
+      updateMainCursor();
       try {
         if (hasPointerEvents && targetCanvas.setPointerCapture && e.pointerId !== undefined) {
           targetCanvas.setPointerCapture(e.pointerId);
@@ -348,13 +356,14 @@ export function createSpectrumInteractionController(
           return;
         }
       }
-      setState({ spectrumHoverActive: true });
       if (state.spectrumDragging) {
         markAutoPanSuppressed();
         preventDefaultIfPossible(e);
         handleDrag(e);
       }
+      setState({ spectrumHoverActive: true });
       markHoverFromEvent(e);
+      updateMainCursor();
     };
 
     const stopInteraction = (
@@ -392,6 +401,7 @@ export function createSpectrumInteractionController(
       if (state.spectrumDragging) {
         if (commit) handleDrag(e);
         clearMainInteractionState();
+        updateMainCursor();
         requestSpectrumRedraw(true);
       }
     };
@@ -405,6 +415,7 @@ export function createSpectrumInteractionController(
         spectrumHoverX: null,
         spectrumHoverY: null,
       });
+      updateMainCursor();
       requestSpectrumRedraw(true);
     };
 

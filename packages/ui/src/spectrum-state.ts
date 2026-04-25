@@ -11,7 +11,9 @@ import type { HeatmapBenchmarkEntry } from "./heatmap-render-core.js";
 export const DEFAULT_MAIN_FPS = 60;
 export const DEFAULT_OVERVIEW_FPS = 24;
 export const DEFAULT_MAIN_HEIGHT = 360;
-export const DEFAULT_OVERVIEW_HEIGHT = 120;
+export const DEFAULT_OVERVIEW_HEIGHT = 96;
+export const DEFAULT_OVERVIEW_RATIO = 0.35;
+const OVERVIEW_RATIO_STORAGE_KEY = "ohmymelody.ui.spectrum.overviewRatio.v1";
 
 export interface SpectrumSectionConfig {
   enabled: boolean;
@@ -41,6 +43,8 @@ export interface SpectrumUiState {
   inference: InferenceResult | null;
   displaySampling: DisplaySamplingConfig;
   pitchRange: SpectrumPitchRange;
+  spectrumOverviewRatio: number;
+  spectrumMainFullscreen: boolean;
   sections: {
     main: SpectrumSectionConfig;
     overview: SpectrumSectionConfig;
@@ -113,6 +117,7 @@ export interface SpectrumUi {
   requestStop(reason?: unknown): void;
   cancel(reason?: unknown): void;
   destroy(reason?: unknown): void;
+  toggleMainFullscreen(next?: boolean): Promise<void>;
   getState(): SpectrumUiState;
   getDebugState(): SpectrumUiDebugState;
   mount(nextMount: HTMLElement | null): void;
@@ -147,6 +152,8 @@ export interface SpectrumInteractionState {
   spectrumW: number;
   spectrumOverviewW: number;
   spectrumH: number;
+  spectrumOverviewRatio: number;
+  spectrumMainFullscreen: boolean;
   spectrumOffset: number;
   spectrumZoom: number;
   spectrumDuration: number;
@@ -267,10 +274,13 @@ export function normalizePitchRange(
 }
 
 export function createDefaultInteractionState(): SpectrumInteractionState {
+  const persistedRatio = readPersistedOverviewRatio();
   return {
     spectrumW: 0,
     spectrumOverviewW: 0,
     spectrumH: 0,
+    spectrumOverviewRatio: persistedRatio ?? DEFAULT_OVERVIEW_RATIO,
+    spectrumMainFullscreen: false,
     spectrumOffset: 0,
     spectrumZoom: 1,
     spectrumDuration: 0,
@@ -281,6 +291,35 @@ export function createDefaultInteractionState(): SpectrumInteractionState {
     spectrumHoverY: null,
     overviewDragging: false,
   };
+}
+
+function readPersistedOverviewRatio(): number | null {
+  if (typeof localStorage === "undefined") {
+    return null;
+  }
+  try {
+    const raw = localStorage.getItem(OVERVIEW_RATIO_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const next = Number(raw);
+    if (!Number.isFinite(next)) {
+      return null;
+    }
+    return clampNumber(next, 0.05, 0.95);
+  } catch {
+    return null;
+  }
+}
+
+export function persistOverviewRatio(nextRatio: number): void {
+  if (typeof localStorage === "undefined") {
+    return;
+  }
+  try {
+    const safe = clampNumber(Number(nextRatio) || 0, 0.05, 0.95);
+    localStorage.setItem(OVERVIEW_RATIO_STORAGE_KEY, String(safe));
+  } catch {}
 }
 
 export function copyState(state: SpectrumUiState): SpectrumUiState {
@@ -294,6 +333,8 @@ export function copyState(state: SpectrumUiState): SpectrumUiState {
     inference: state.inference,
     displaySampling: { ...state.displaySampling },
     pitchRange: { ...state.pitchRange },
+    spectrumOverviewRatio: state.spectrumOverviewRatio,
+    spectrumMainFullscreen: state.spectrumMainFullscreen,
     sections: {
       main: { ...state.sections.main },
       overview: { ...state.sections.overview },

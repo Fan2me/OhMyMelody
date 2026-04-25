@@ -10,8 +10,6 @@ export type PlotMetrics = {
   plotH: number;
 };
 
-const FRAME_RATE_HZ = 100;
-
 export function getMainViewFrameCount(state: Pick<SpectrumInteractionState, "spectrumW" | "spectrumZoom" | "spectrumDuration">): number {
   const safeTotalFrames = Math.max(1, Math.floor(Number(state.spectrumW) || 0));
   const safeZoom = Math.max(1, Number(state.spectrumZoom) || 1);

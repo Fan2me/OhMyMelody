@@ -14,6 +14,7 @@ import {
   createDefaultInteractionState,
   createDefaultSections,
   createDefaultDisplaySampling,
+  DEFAULT_OVERVIEW_RATIO,
   normalizePitchRange,
   copyState,
   mergeSectionConfig,
@@ -102,6 +103,22 @@ function getCancelMessage(reason: unknown): string {
   return "Cancelled";
 }
 
+function isEditableShortcutTarget(target: EventTarget | null): boolean {
+  if (!target || !(target instanceof Element)) {
+    return false;
+  }
+  if (target instanceof HTMLInputElement) {
+    return true;
+  }
+  if (target instanceof HTMLTextAreaElement) {
+    return true;
+  }
+  if (target instanceof HTMLSelectElement) {
+    return true;
+  }
+  return target instanceof HTMLElement && target.isContentEditable;
+}
+
 function createInitialState(options: SpectrumUiOptions): SpectrumUiState {
   return {
     status: "idle",
@@ -113,6 +130,8 @@ function createInitialState(options: SpectrumUiOptions): SpectrumUiState {
     inference: null,
     displaySampling: createDefaultDisplaySampling((options as { displaySampling?: any }).displaySampling ?? {}),
     pitchRange: normalizePitchRange(options.pitchRange),
+    spectrumOverviewRatio: DEFAULT_OVERVIEW_RATIO,
+    spectrumMainFullscreen: false,
     sections: createDefaultSections(options.sections),
   };
 }
@@ -131,6 +150,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
   let mountTarget: HTMLElement | null = options.mount ?? null;
   let audioElement: HTMLAudioElement | null = options.audioElement ?? null;
   let analysisCleanup: (() => void) | null = null;
+  let keyboardCleanup: (() => void) | null = null;
   let abortController: AbortController | null = null;
   let analysisToken = 0;
   let timeline = buildSpectrumTimeline([]);
@@ -152,9 +172,9 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
   const getOverviewCanvasRef = () => renderController?.getOverviewOverlayCanvas() ?? null;
 
   function rebuildTimelineFromBatches(): void {
-    const nextSource = cfpBatches.map((batch) => [batch] as const);
+    const nextSource = cfpBatches.length ? [cfpBatches] : [];
     timeline = buildSpectrumTimeline(nextSource);
-    interactionState.spectrumOverviewW = Math.max(0, timeline.totalSlots);
+    interactionState.spectrumOverviewW = Math.max(0, timeline.totalFrames);
     interactionState.spectrumH = Math.max(1, timeline.freqCount || 1);
     const viewW = getMainViewFrameCount({
       spectrumW: Math.max(1, interactionState.spectrumW),
@@ -277,6 +297,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     getAudioElement: () => audioElement,
     getPredictionFrames: () => progressiveVisualizer?.state.predictionArgmax ?? [],
     getPredictionConfidence: () => progressiveVisualizer?.state.predictionConfidence ?? null,
+    getPredictionRevision: () => progressiveVisualizer?.state.predictionRevision ?? 0,
   });
 
   const overviewOverlayRenderer = createSpectrumOverviewOverlayRenderer({
@@ -342,6 +363,37 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
       renderController.requestOverviewOverlayRedraw();
     },
   });
+
+  if (documentRef && typeof documentRef.addEventListener === "function") {
+    const handleGlobalKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.altKey || event.ctrlKey || event.metaKey) {
+        return;
+      }
+      if (isEditableShortcutTarget(event.target)) {
+        return;
+      }
+      if (event.code === "KeyF" || event.key === "f" || event.key === "F") {
+        event.preventDefault();
+        void renderController.toggleMainFullscreen();
+        return;
+      }
+      if (event.code === "Space" || event.key === " ") {
+        if (!audioElement) {
+          return;
+        }
+        event.preventDefault();
+        if (audioElement.paused || audioElement.ended) {
+          void audioElement.play().catch(() => undefined);
+        } else {
+          audioElement.pause();
+        }
+      }
+    };
+    documentRef.addEventListener("keydown", handleGlobalKeyDown);
+    keyboardCleanup = () => {
+      documentRef.removeEventListener("keydown", handleGlobalKeyDown);
+    };
+  }
 
   function emit(next: Partial<SpectrumUiState>, redrawMask = 0): SpectrumUiState {
     if (Object.prototype.hasOwnProperty.call(next, "status")) {
@@ -672,6 +724,8 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
 
   function destroy(reason: unknown = "UI controller destroyed"): void {
     cancel(reason);
+    keyboardCleanup?.();
+    keyboardCleanup = null;
     interactionController.destroy();
     renderController.destroy();
     if (mountTarget) {
@@ -887,6 +941,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     requestStop,
     cancel,
     destroy,
+    toggleMainFullscreen: (next?: boolean) => renderController.toggleMainFullscreen(next),
     getState,
     getDebugState,
     mount,

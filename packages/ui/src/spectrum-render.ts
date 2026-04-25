@@ -6,12 +6,14 @@ import {
   type HeatmapOptimizationLevel,
   type HeatmapTimeline,
 } from "./heatmap-render-core.js";
+import { getModuleLogger } from "@ohm/core/logging/logger.js";
 import {
-  DEFAULT_MAIN_HEIGHT,
-  DEFAULT_OVERVIEW_HEIGHT,
   DEFAULT_MAIN_FPS,
   DEFAULT_OVERVIEW_FPS,
+  DEFAULT_OVERVIEW_RATIO,
   DIRTY,
+  clampNumber,
+  persistOverviewRatio,
   type SpectrumInteractionState,
   type SpectrumUiState,
 } from "./spectrum-state.js";
@@ -38,11 +40,17 @@ export interface SpectrumRenderControllerDeps {
 }
 
 const FRAME_SEC = 0.01;
+const MIN_MAIN_SECTION_HEIGHT = 240;
+const MIN_OVERVIEW_SECTION_HEIGHT = 96;
+const SPLITTER_HIT_HEIGHT = 14;
+const OVERVIEW_RATIO_FALLBACK = DEFAULT_OVERVIEW_RATIO;
+const spectrumRenderLogger = getModuleLogger("core.ui.spectrum.render");
 
 export interface SpectrumRenderController {
   mount(nextMount: HTMLElement | null): void;
   attachAudioElement(nextAudioElement: HTMLAudioElement | null): void;
   setTimeline(nextTimeline: HeatmapTimeline | null): void;
+  toggleMainFullscreen(next?: boolean): Promise<void>;
   requestSpectrumRedraw(next?: boolean | { force?: boolean; includeOverviewBase?: boolean; dirtyMask?: number }): void;
   requestOverviewOverlayRedraw(): void;
   runHeatmapBenchmark(rounds?: number): HeatmapBenchmarkEntry[];
@@ -79,6 +87,36 @@ function drawHeatmap(
   );
 }
 
+function getClientPointFromEvent(event: MouseEvent | PointerEvent | TouchEvent | null) {
+  if (!event) return null;
+  const mouseLike = event as MouseEvent | PointerEvent;
+  if (Number.isFinite(mouseLike.clientX) && Number.isFinite(mouseLike.clientY)) {
+    return {
+      clientX: mouseLike.clientX,
+      clientY: mouseLike.clientY,
+    };
+  }
+  const touchEvent = event as TouchEvent;
+  const touch =
+    (touchEvent.touches && touchEvent.touches[0]) ||
+    (touchEvent.changedTouches && touchEvent.changedTouches[0]) ||
+    null;
+  if (!touch) return null;
+  return {
+    clientX: touch.clientX,
+    clientY: touch.clientY,
+  };
+}
+
+function preventDefaultIfPossible(event: unknown) {
+  if (
+    event &&
+    typeof (event as { preventDefault?: () => void }).preventDefault === "function"
+  ) {
+    (event as { preventDefault: () => void }).preventDefault();
+  }
+}
+
 export function createSpectrumRenderController(
   deps: SpectrumRenderControllerDeps,
 ): SpectrumRenderController {
@@ -103,6 +141,10 @@ export function createSpectrumRenderController(
   let overviewBaseCtx: CanvasRenderingContext2D | null = null;
   let overviewOverlayCtx: CanvasRenderingContext2D | null = null;
   let placeholder: HTMLDivElement | null = null;
+  let splitBar: HTMLDivElement | null = null;
+  let splitBarHandle: HTMLDivElement | null = null;
+  let toolbar: HTMLDivElement | null = null;
+  let mainFullscreenToggle: HTMLButtonElement | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let audioCleanup: (() => void) | null = null;
   let audioElement: HTMLAudioElement | null = null;
@@ -112,8 +154,21 @@ export function createSpectrumRenderController(
   let playing = false;
   let lastAutoPanAt = 0;
   let autoPanSuppressedUntil = 0;
-  let heatmapTimelineSeq = 0;
   let timeline: HeatmapTimeline | null = null;
+  let fullscreenCleanup: (() => void) | null = null;
+  let controlsVisible = false;
+  let lastAutoPanLogKey = "";
+  let lastHeatmapRenderLogKey = "";
+  const layoutMetrics = {
+    rootHeight: 0,
+    mainWidth: 0,
+    mainHeight: 0,
+    overviewWidth: 0,
+    overviewHeight: 0,
+  };
+  let splitDragRootTop = 0;
+  let splitDragRootHeight = 0;
+  let lastLayoutSignature = "";
   const lastDrawAt = {
     mainBase: 0,
     mainOverlay: 0,
@@ -124,74 +179,238 @@ export function createSpectrumRenderController(
   const AUTO_PAN_MIN_INTERVAL_MS = 33;
   const AUTO_PAN_EDGE_RATIO = 1 / 10;
   const AUTO_PAN_SUPPRESS_MS = 250;
+  const cleanups: Array<() => void> = [];
+
+  function refreshLayoutMetricsFromElements(): void {
+    layoutMetrics.rootHeight = Math.max(
+      0,
+      root?.clientHeight || root?.offsetHeight || 0,
+    );
+    layoutMetrics.mainWidth = Math.max(
+      0,
+      mainSection?.clientWidth || mainSection?.offsetWidth || 0,
+    );
+    layoutMetrics.mainHeight = Math.max(
+      0,
+      mainSection?.clientHeight || mainSection?.offsetHeight || 0,
+    );
+    layoutMetrics.overviewWidth = Math.max(
+      0,
+      overviewSection?.clientWidth || overviewSection?.offsetWidth || 0,
+    );
+    layoutMetrics.overviewHeight = Math.max(
+      0,
+      overviewSection?.clientHeight || overviewSection?.offsetHeight || 0,
+    );
+  }
+
+  function refreshLayoutMetricsFromObserver(entries: readonly ResizeObserverEntry[]): void {
+    for (const entry of entries) {
+      const target = entry.target;
+      if (target === root) {
+        layoutMetrics.rootHeight = Math.max(0, Math.floor(entry.contentRect.height || 0));
+        continue;
+      }
+      if (target === mainSection) {
+        layoutMetrics.mainWidth = Math.max(0, Math.floor(entry.contentRect.width || 0));
+        layoutMetrics.mainHeight = Math.max(0, Math.floor(entry.contentRect.height || 0));
+        continue;
+      }
+      if (target === overviewSection) {
+        layoutMetrics.overviewWidth = Math.max(0, Math.floor(entry.contentRect.width || 0));
+        layoutMetrics.overviewHeight = Math.max(0, Math.floor(entry.contentRect.height || 0));
+      }
+    }
+  }
 
   function destroyHeatmapWorker(): void {
     return;
   }
 
-  function clearQueuedHeatmapRequests(): void {
-    return;
+  function getOverviewRatioBounds(): { min: number; max: number } {
+    const rootHeight = Math.max(0, layoutMetrics.rootHeight || 0);
+    const availableHeight = Math.max(1, rootHeight - SPLITTER_HIT_HEIGHT);
+    const minRatio = rootHeight > 0
+      ? clampNumber(MIN_OVERVIEW_SECTION_HEIGHT / availableHeight, 0.08, 0.92)
+      : 0.12;
+    const maxRatio = rootHeight > 0
+      ? clampNumber(1 - MIN_MAIN_SECTION_HEIGHT / availableHeight, minRatio, 0.92)
+      : OVERVIEW_RATIO_FALLBACK;
+    return {
+      min: Math.min(minRatio, maxRatio),
+      max: Math.max(minRatio, maxRatio),
+    };
   }
 
-  function attachHeatmapWorkerHandlers(nextWorker: Worker): Worker {
-    return nextWorker;
+  function resolveOverviewRatio(): number {
+    const interactionState = getInteractionState();
+    const bounds = getOverviewRatioBounds();
+    const currentRatio = Number(interactionState.spectrumOverviewRatio);
+    if (!Number.isFinite(currentRatio) || currentRatio <= 0) {
+      const nextRatio = clampNumber(
+        root?.isConnected ? OVERVIEW_RATIO_FALLBACK : DEFAULT_OVERVIEW_RATIO,
+        bounds.min,
+        bounds.max,
+      );
+      if (root?.isConnected) {
+        interactionState.spectrumOverviewRatio = nextRatio;
+        persistOverviewRatio(nextRatio);
+      }
+      return nextRatio;
+    }
+    const clampedRatio = clampNumber(currentRatio, bounds.min, bounds.max);
+    if (clampedRatio !== interactionState.spectrumOverviewRatio) {
+      interactionState.spectrumOverviewRatio = clampedRatio;
+      persistOverviewRatio(clampedRatio);
+    }
+    return clampedRatio;
   }
 
-  function flushQueuedHeatmapRequest(): void {
-    return;
-  }
-
-  function buildHeatmapRenderSignature(args: {
-    target: "main" | "overview";
-    width: number;
-    height: number;
-    viewport: { startSlot: number; endSlot: number } | null;
-    viewportMode: "slots" | "frames";
-    representativeMode: string;
-    frequencyViewport: HeatmapFrequencyViewport | null;
-    sampleStrideFrames: number;
-    optimizationLevel: HeatmapOptimizationLevel;
-  }): string {
-    const vp = args.viewport;
-    const fvp = args.frequencyViewport;
-    return [
-      `seq:${heatmapTimelineSeq}`,
-      `target:${args.target}`,
-      `size:${args.width}x${args.height}`,
-      `mode:${args.viewportMode}`,
-      `rep:${args.representativeMode}`,
-      `stride:${args.sampleStrideFrames}`,
-      `opt:${args.optimizationLevel}`,
-      `vp:${vp ? `${vp.startSlot}-${vp.endSlot}` : "none"}`,
-      `fvp:${fvp ? `${fvp.minBin}-${fvp.maxBin}` : "none"}`,
+  function applySectionLayout(): void {
+    const state = getState();
+    const interactionState = getInteractionState();
+    const mainVisible = !!state.audio && state.sections.main.enabled;
+    const overviewVisible = !!state.audio && state.sections.overview.enabled;
+    const ratio = resolveOverviewRatio();
+    const isFullscreen = interactionState.spectrumMainFullscreen === true;
+    const signature = [
+      mainVisible ? 1 : 0,
+      overviewVisible ? 1 : 0,
+      isFullscreen ? 1 : 0,
+      controlsVisible ? 1 : 0,
+      ratio.toFixed(6),
     ].join("|");
+    if (signature === lastLayoutSignature) {
+      return;
+    }
+    lastLayoutSignature = signature;
+
+    if (placeholder) {
+      placeholder.style.display = mainVisible || overviewVisible ? "none" : "flex";
+    }
+
+    if (mainFullscreenToggle) {
+      mainFullscreenToggle.disabled = !mainVisible;
+      mainFullscreenToggle.textContent = isFullscreen ? "⤡" : "⛶";
+      mainFullscreenToggle.title = isFullscreen ? "退出主图全屏 (F)" : "主图全屏 (F)";
+      mainFullscreenToggle.setAttribute("aria-pressed", isFullscreen ? "true" : "false");
+    }
+
+    if (toolbar) {
+      toolbar.style.display = mainVisible ? "flex" : "none";
+      toolbar.style.opacity = controlsVisible && mainVisible ? "1" : "0";
+      toolbar.style.transform = controlsVisible && mainVisible ? "translateY(0)" : "translateY(-4px)";
+      toolbar.style.pointerEvents = controlsVisible && mainVisible ? "auto" : "none";
+    }
+
+    if (splitBar) {
+      splitBar.style.display = mainVisible && overviewVisible && !isFullscreen ? "" : "none";
+      splitBar.style.opacity = isFullscreen ? "0" : "0.06";
+      splitBar.style.cursor = isFullscreen ? "default" : "row-resize";
+    }
+    if (splitBarHandle) {
+      splitBarHandle.style.opacity = isFullscreen ? "0" : "0.16";
+    }
+
+    if (overviewSection) {
+      overviewSection.style.display = overviewVisible ? "" : "none";
+      overviewSection.style.flex = mainVisible && overviewVisible
+        ? `${ratio} ${ratio} 0px`
+        : "0 0 auto";
+      overviewSection.style.minHeight = `${MIN_OVERVIEW_SECTION_HEIGHT}px`;
+    }
+
+    if (mainSection) {
+      mainSection.style.display = mainVisible ? "" : "none";
+      mainSection.style.flex = mainVisible && overviewVisible
+        ? `${1 - ratio} ${1 - ratio} 0px`
+        : "1 1 auto";
+      mainSection.style.minHeight = isFullscreen ? "0px" : `${MIN_MAIN_SECTION_HEIGHT}px`;
+      mainSection.style.border = isFullscreen ? "0" : "1px solid rgba(54, 80, 130, 0.08)";
+      mainSection.style.borderRadius = isFullscreen ? "0" : "0";
+      mainSection.style.background = isFullscreen ? "transparent" : "rgba(245, 248, 255, 0.9)";
+      mainSection.style.boxShadow = isFullscreen ? "none" : "inset 0 1px 0 rgba(255, 255, 255, 0.72), 0 10px 24px rgba(19, 37, 70, 0.08)";
+    }
+  }
+
+  function syncFullscreenStateFromDocument(): void {
+    const interactionState = getInteractionState();
+    const isFullscreen = documentRef?.fullscreenElement === mainSection;
+    if (interactionState.spectrumMainFullscreen === isFullscreen) {
+      return;
+    }
+    interactionState.spectrumMainFullscreen = isFullscreen;
+    applySectionLayout();
+    schedule(DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY, true);
+  }
+
+  async function setMainFullscreen(nextFullscreen: boolean): Promise<void> {
+    const next = !!nextFullscreen;
+    const isFullscreen = documentRef?.fullscreenElement === mainSection;
+    if (next === isFullscreen) {
+      return;
+    }
+    if (!mainSection) {
+      return;
+    }
+    try {
+      if (next) {
+        await mainSection.requestFullscreen();
+      } else if (documentRef?.fullscreenElement) {
+        await documentRef.exitFullscreen();
+      }
+    } catch (error) {
+      console.warn(
+        `ui spectrum fullscreen unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    syncFullscreenStateFromDocument();
+  }
+
+  function updateOverviewRatioFromPoint(clientY: number): void {
+    const interactionState = getInteractionState();
+    if (splitDragRootHeight <= 0) {
+      return;
+    }
+    const bounds = getOverviewRatioBounds();
+    const usableHeight = Math.max(1, splitDragRootHeight - SPLITTER_HIT_HEIGHT);
+    const nextRatio = clampNumber(
+      (clientY - splitDragRootTop) / usableHeight,
+      bounds.min,
+      bounds.max,
+    );
+    if (nextRatio === interactionState.spectrumOverviewRatio) {
+      return;
+    }
+    interactionState.spectrumOverviewRatio = nextRatio;
+    persistOverviewRatio(nextRatio);
+    applySectionLayout();
+    schedule(undefined, true);
   }
 
   function syncSectionVisibility(): void {
     const state = getState();
     const hasAudio = !!state.audio;
     if (placeholder) {
-      placeholder.style.display = hasAudio ? "none" : "flex";
+      const nextDisplay = hasAudio ? "none" : "flex";
+      if (placeholder.style.display !== nextDisplay) {
+        placeholder.style.display = nextDisplay;
+      }
     }
-    const mainVisible = hasAudio && state.sections.main.enabled;
-    const overviewVisible = hasAudio && state.sections.overview.enabled;
-    if (mainSection) {
-      mainSection.style.display = mainVisible ? "" : "none";
-      mainSection.style.flex =
-        mainVisible && overviewVisible ? "1 1 auto" : mainVisible ? "1 1 auto" : "0 0 auto";
-    }
-    if (overviewSection) {
-      overviewSection.style.display = overviewVisible ? "" : "none";
-      overviewSection.style.flex =
-        overviewVisible && mainVisible ? "0 0 auto" : overviewVisible ? "1 1 auto" : "0 0 auto";
-    }
+    applySectionLayout();
     if (mainOverlay) {
-      mainOverlay.style.display =
-        mainVisible && state.sections.main.overlay ? "" : "none";
+      const nextDisplay =
+        hasAudio && state.sections.main.enabled && state.sections.main.overlay ? "" : "none";
+      if (mainOverlay.style.display !== nextDisplay) {
+        mainOverlay.style.display = nextDisplay;
+      }
     }
     if (overviewOverlay) {
-      overviewOverlay.style.display =
-        overviewVisible && state.sections.overview.overlay ? "" : "none";
+      const nextDisplay =
+        hasAudio && state.sections.overview.enabled && !getInteractionState().spectrumMainFullscreen && state.sections.overview.overlay ? "" : "none";
+      if (overviewOverlay.style.display !== nextDisplay) {
+        overviewOverlay.style.display = nextDisplay;
+      }
     }
   }
 
@@ -201,6 +420,13 @@ export function createSpectrumRenderController(
       return 0;
     }
     return currentTime / FRAME_SEC;
+  }
+
+  function syncToolbarVisibility(nextVisible?: boolean): void {
+    if (typeof nextVisible === "boolean") {
+      controlsVisible = nextVisible;
+    }
+    applySectionLayout();
   }
 
   function markAutoPanSuppressed(nowTs = performance.now(), durationMs = AUTO_PAN_SUPPRESS_MS): void {
@@ -235,9 +461,9 @@ export function createSpectrumRenderController(
       return false;
     }
 
-    const edgeThreshold = Math.max(1, viewW * AUTO_PAN_EDGE_RATIO);
+    const playheadMode = "follow";
     let desiredOffset = offset;
-
+    const edgeThreshold = Math.max(1, viewW * AUTO_PAN_EDGE_RATIO);
     if (frameFloat >= offset + viewW - edgeThreshold) {
       desiredOffset = Math.floor(frameFloat - edgeThreshold);
     } else if (frameFloat < offset + edgeThreshold) {
@@ -259,15 +485,26 @@ export function createSpectrumRenderController(
     interactionState.spectrumOffset = desiredOffset;
     dirtyMask |= DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY;
     lastAutoPanAt = nowTs;
+    const autoPanLogKey = [
+      playheadMode,
+      `frame=${frameFloat.toFixed(2)}`,
+      `offset=${offset}`,
+      `desired=${desiredOffset}`,
+      `viewW=${viewW}`,
+      `max=${maxOffset}`,
+    ].join("|");
+    if (autoPanLogKey !== lastAutoPanLogKey) {
+      lastAutoPanLogKey = autoPanLogKey;
+      spectrumRenderLogger.info("auto-pan updated", {
+        playheadMode,
+        frameFloat,
+        offset,
+        desiredOffset,
+        viewW,
+        maxOffset,
+      });
+    }
     return true;
-  }
-
-  function ensureHeatmapWorker(): Worker | null {
-    return null;
-  }
-
-  function postHeatmapTimeline(): void {
-    return;
   }
 
   function resolveSpectrumFrequencyViewport(
@@ -310,6 +547,25 @@ export function createSpectrumRenderController(
     const { target, now, canvas, ctx, viewport, representativeMode, frequencyViewport, sampleStrideFrames } = args;
     if (!canvas || !ctx) {
       return;
+    }
+    const renderLogKey = [
+      args.target,
+      `vp=${args.viewport.startSlot}-${args.viewport.endSlot}`,
+      `stride=${args.sampleStrideFrames}`,
+      `freq=${args.frequencyViewport.minBin}-${args.frequencyViewport.maxBin}`,
+    ].join("|");
+    if (renderLogKey !== lastHeatmapRenderLogKey) {
+      lastHeatmapRenderLogKey = renderLogKey;
+      spectrumRenderLogger.info("heatmap render request", {
+        target: args.target,
+        viewportStart: args.viewport.startSlot,
+        viewportEnd: args.viewport.endSlot,
+        sampleStrideFrames: args.sampleStrideFrames,
+        frequencyViewport: {
+          minBin: args.frequencyViewport.minBin,
+          maxBin: args.frequencyViewport.maxBin,
+        },
+      });
     }
     drawHeatmap(
       ctx,
@@ -354,24 +610,39 @@ export function createSpectrumRenderController(
     rafId = null;
   }
 
-  function resizeCanvas(canvas: HTMLCanvasElement, host: HTMLElement): void {
-    const dpr = Math.max(1, windowRef?.devicePixelRatio || 1);
-    const width = Math.max(1, Math.floor(host.clientWidth || host.getBoundingClientRect().width || 1));
-    const height = Math.max(1, Math.floor(host.clientHeight || host.getBoundingClientRect().height || 1));
-    const nextWidth = Math.max(1, Math.floor(width * dpr));
-    const nextHeight = Math.max(1, Math.floor(height * dpr));
+  function resizeCanvas(
+    canvas: HTMLCanvasElement,
+    width: number,
+    height: number,
+    maxDpr = Number.POSITIVE_INFINITY,
+  ): void {
+    const dpr = Math.max(
+      1,
+      Math.min(maxDpr, windowRef?.devicePixelRatio || 1),
+    );
+    const nextWidth = Math.max(1, Math.floor(Math.max(1, width) * dpr));
+    const nextHeight = Math.max(1, Math.floor(Math.max(1, height) * dpr));
     if (canvas.width !== nextWidth) canvas.width = nextWidth;
     if (canvas.height !== nextHeight) canvas.height = nextHeight;
   }
 
   function syncCanvasSizes(): void {
     if (mainSection && mainBase && mainOverlay) {
-      resizeCanvas(mainBase, mainSection);
-      resizeCanvas(mainOverlay, mainSection);
+      resizeCanvas(mainBase, layoutMetrics.mainWidth, layoutMetrics.mainHeight, 1);
+      resizeCanvas(mainOverlay, layoutMetrics.mainWidth, layoutMetrics.mainHeight);
     }
     if (overviewSection && overviewBase && overviewOverlay) {
-      resizeCanvas(overviewBase, overviewSection);
-      resizeCanvas(overviewOverlay, overviewSection);
+      resizeCanvas(
+        overviewBase,
+        layoutMetrics.overviewWidth,
+        layoutMetrics.overviewHeight,
+        1,
+      );
+      resizeCanvas(
+        overviewOverlay,
+        layoutMetrics.overviewWidth,
+        layoutMetrics.overviewHeight,
+      );
     }
   }
 
@@ -525,6 +796,7 @@ export function createSpectrumRenderController(
     if (root) return root;
 
     const nextRoot = createSpectrumRootContainer(documentRef);
+    nextRoot.style.gap = "0";
     const nextPlaceholder = documentRef.createElement("div");
     nextPlaceholder.style.position = "absolute";
     nextPlaceholder.style.inset = "12px";
@@ -540,13 +812,85 @@ export function createSpectrumRenderController(
     nextPlaceholder.textContent = "选择音频后开始显示频谱";
     placeholder = nextPlaceholder;
 
-    const overview = createSpectrumSection(documentRef, "overview", DEFAULT_OVERVIEW_HEIGHT);
-    const main = createSpectrumSection(documentRef, "main", DEFAULT_MAIN_HEIGHT);
+    const nextSplitter = documentRef.createElement("div");
+    nextSplitter.style.height = "2px";
+    nextSplitter.style.flex = "0 0 auto";
+    nextSplitter.style.position = "relative";
+    nextSplitter.style.borderRadius = "999px";
+    nextSplitter.style.cursor = "row-resize";
+    nextSplitter.style.touchAction = "none";
+    nextSplitter.style.userSelect = "none";
+    nextSplitter.style.display = "flex";
+    nextSplitter.style.alignItems = "center";
+    nextSplitter.style.justifyContent = "center";
+    nextSplitter.style.padding = "0";
+    nextSplitter.style.background = "transparent";
+    nextSplitter.style.opacity = "0.06";
+    nextSplitter.style.transition = "opacity 0.12s ease";
+    nextSplitter.setAttribute("role", "separator");
+    nextSplitter.setAttribute("aria-orientation", "horizontal");
+    nextSplitter.title = "拖拽调整 overview / main 比例";
+    const nextSplitterHandle = documentRef.createElement("div");
+    nextSplitterHandle.style.width = "100%";
+    nextSplitterHandle.style.height = "2px";
+    nextSplitterHandle.style.borderRadius = "999px";
+    nextSplitterHandle.style.background = "rgba(17, 87, 216, 0.16)";
+    nextSplitterHandle.style.boxShadow = "none";
+    nextSplitter.appendChild(nextSplitterHandle);
+    splitBar = nextSplitter;
+    splitBarHandle = nextSplitterHandle;
+
+    const overview = createSpectrumSection(documentRef, "overview", MIN_OVERVIEW_SECTION_HEIGHT);
+    const main = createSpectrumSection(documentRef, "main", MIN_MAIN_SECTION_HEIGHT);
     main.section.style.flex = "1 1 auto";
-    overview.section.style.flex = "0 0 auto";
+    overview.section.style.flex = "1 1 auto";
+    main.section.style.minHeight = `${MIN_MAIN_SECTION_HEIGHT}px`;
+    overview.section.style.minHeight = `${MIN_OVERVIEW_SECTION_HEIGHT}px`;
+
+    const nextToolbar = documentRef.createElement("div");
+    nextToolbar.style.position = "absolute";
+    nextToolbar.style.top = "12px";
+    nextToolbar.style.right = "12px";
+    nextToolbar.style.zIndex = "4";
+    nextToolbar.style.display = "flex";
+    nextToolbar.style.gap = "8px";
+    nextToolbar.style.alignItems = "center";
+    nextToolbar.style.pointerEvents = "none";
+    nextToolbar.style.opacity = "0";
+    nextToolbar.style.transform = "translateY(-4px)";
+    nextToolbar.style.transition = "opacity 0.12s ease, transform 0.12s ease";
+    const makeToolbarButton = (title: string) => {
+      const button = documentRef.createElement("button");
+      button.type = "button";
+      button.style.width = "32px";
+      button.style.height = "32px";
+      button.style.display = "inline-flex";
+      button.style.alignItems = "center";
+      button.style.justifyContent = "center";
+      button.style.border = "1px solid rgba(17, 87, 216, 0.14)";
+      button.style.borderRadius = "999px";
+      button.style.background = "rgba(255, 255, 255, 0.88)";
+      button.style.color = "var(--primary-strong)";
+      button.style.boxShadow = "0 10px 18px rgba(19, 37, 70, 0.08)";
+      button.style.cursor = "pointer";
+      button.style.userSelect = "none";
+      button.style.touchAction = "manipulation";
+      button.style.pointerEvents = "auto";
+      button.title = title;
+      button.setAttribute("aria-label", title);
+      return button;
+    };
+    const nextFullscreenToggle = makeToolbarButton("主图全屏 (F)");
+    nextFullscreenToggle.addEventListener("click", () => {
+      const interactionState = getInteractionState();
+      void setMainFullscreen(!interactionState.spectrumMainFullscreen);
+    });
+    nextToolbar.appendChild(nextFullscreenToggle);
+    main.section.appendChild(nextToolbar);
 
     nextRoot.appendChild(nextPlaceholder);
     nextRoot.appendChild(overview.section);
+    nextRoot.appendChild(nextSplitter);
     nextRoot.appendChild(main.section);
     root = nextRoot;
     overviewSection = overview.section;
@@ -555,18 +899,185 @@ export function createSpectrumRenderController(
     overviewBaseCtx = overview.baseCtx;
     overviewOverlayCtx = overview.overlayCtx;
     mainSection = main.section;
+    toolbar = nextToolbar;
     mainBase = main.base;
     mainOverlay = main.overlay;
     mainBaseCtx = main.baseCtx;
     mainOverlayCtx = main.overlayCtx;
+    mainFullscreenToggle = nextFullscreenToggle;
+    refreshLayoutMetricsFromElements();
 
     if (typeof ResizeObserver !== "undefined") {
       resizeObserver?.disconnect();
-      resizeObserver = new ResizeObserver(() => schedule(undefined, true));
+      resizeObserver = new ResizeObserver((entries) => {
+        refreshLayoutMetricsFromObserver(entries);
+        schedule(undefined, true);
+      });
       resizeObserver.observe(nextRoot);
       resizeObserver.observe(main.section);
       resizeObserver.observe(overview.section);
+      resizeObserver.observe(nextSplitter);
     }
+    if (documentRef && typeof documentRef.addEventListener === "function") {
+      const handleFullscreenChange = () => {
+        syncFullscreenStateFromDocument();
+      };
+      const handleFullscreenError = () => {
+        syncFullscreenStateFromDocument();
+      };
+      documentRef.addEventListener("fullscreenchange", handleFullscreenChange);
+      documentRef.addEventListener("fullscreenerror", handleFullscreenError);
+      fullscreenCleanup = () => {
+        documentRef.removeEventListener("fullscreenchange", handleFullscreenChange);
+        documentRef.removeEventListener("fullscreenerror", handleFullscreenError);
+      };
+      cleanups.push(() => {
+        fullscreenCleanup?.();
+        fullscreenCleanup = null;
+      });
+    }
+    const splitDraggingState = {
+      active: false,
+      pointerId: -1,
+    };
+    const getSplitPoint = (event: MouseEvent | PointerEvent | TouchEvent | null) => {
+      const point = getClientPointFromEvent(event);
+      if (!point) {
+        return null;
+      }
+      return point;
+    };
+    const beginSplitDrag = (event: MouseEvent | PointerEvent | TouchEvent | null) => {
+      if (!mainSection || !overviewSection) {
+        return;
+      }
+      const state = getState();
+      if (!state.audio || state.sections.main.enabled === false || state.sections.overview.enabled === false) {
+        return;
+      }
+      preventDefaultIfPossible(event);
+      const point = getSplitPoint(event);
+      if (!point) {
+        return;
+      }
+      const rootRect = root?.getBoundingClientRect() || null;
+      if (!rootRect || rootRect.height <= 0) {
+        return;
+      }
+      splitDragRootTop = rootRect.top;
+      splitDragRootHeight = rootRect.height;
+      splitDraggingState.active = true;
+      nextSplitter.style.opacity = "0.14";
+      nextSplitterHandle.style.opacity = "0.3";
+      const pointerEvent = event as PointerEvent | null;
+      splitDraggingState.pointerId =
+        pointerEvent && Number.isFinite(pointerEvent.pointerId) ? pointerEvent.pointerId : -1;
+      updateOverviewRatioFromPoint(point.clientY);
+      try {
+        if (
+          splitDraggingState.pointerId >= 0 &&
+          nextSplitter.setPointerCapture
+        ) {
+          nextSplitter.setPointerCapture(splitDraggingState.pointerId);
+        }
+      } catch {}
+    };
+    const moveSplitDrag = (event: MouseEvent | PointerEvent | TouchEvent | null) => {
+      if (!splitDraggingState.active) {
+        return;
+      }
+      preventDefaultIfPossible(event);
+      const point = getSplitPoint(event);
+      if (!point) {
+        return;
+      }
+      updateOverviewRatioFromPoint(point.clientY);
+    };
+    const endSplitDrag = (event: MouseEvent | PointerEvent | TouchEvent | null) => {
+      if (!splitDraggingState.active) {
+        return;
+      }
+      preventDefaultIfPossible(event);
+      const point = getSplitPoint(event);
+      if (point) {
+        updateOverviewRatioFromPoint(point.clientY);
+      }
+      splitDraggingState.active = false;
+      splitDragRootTop = 0;
+      splitDragRootHeight = 0;
+      try {
+        const pointerEvent = event as PointerEvent | null;
+        if (
+          splitDraggingState.pointerId >= 0 &&
+          nextSplitter.releasePointerCapture &&
+          pointerEvent &&
+          pointerEvent.pointerId === splitDraggingState.pointerId
+        ) {
+          nextSplitter.releasePointerCapture(pointerEvent.pointerId);
+        }
+      } catch {}
+      splitDraggingState.pointerId = -1;
+      nextSplitter.style.opacity = "0.06";
+      nextSplitterHandle.style.opacity = "0.16";
+    };
+    const handleSplitterPointerEnter = () => {
+      if (!splitDraggingState.active) {
+        nextSplitter.style.opacity = "0.12";
+        nextSplitterHandle.style.opacity = "0.2";
+      }
+    };
+    const handleSplitterPointerLeave = () => {
+      if (!splitDraggingState.active) {
+        nextSplitter.style.opacity = "0.06";
+        nextSplitterHandle.style.opacity = "0.16";
+      }
+    };
+    nextSplitter.onpointerdown = null;
+    nextSplitter.onpointermove = null;
+    nextSplitter.onpointerup = null;
+    nextSplitter.onpointercancel = null;
+    nextSplitter.onmousedown = null;
+    nextSplitter.onmousemove = null;
+    nextSplitter.onmouseup = null;
+    nextSplitter.ontouchstart = null;
+    nextSplitter.ontouchmove = null;
+    nextSplitter.ontouchend = null;
+    nextSplitter.ontouchcancel = null;
+    const hasPointerEvents =
+      !!windowRef &&
+      typeof (
+        windowRef as Window & { PointerEvent?: typeof PointerEvent }
+      ).PointerEvent === "function";
+    if (hasPointerEvents) {
+      nextSplitter.onpointerdown = beginSplitDrag;
+      nextSplitter.onpointermove = moveSplitDrag;
+      nextSplitter.onpointerup = endSplitDrag;
+      nextSplitter.onpointercancel = endSplitDrag;
+    } else {
+      nextSplitter.onmousedown = beginSplitDrag;
+      nextSplitter.onmousemove = moveSplitDrag;
+      nextSplitter.onmouseup = endSplitDrag;
+      nextSplitter.ontouchstart = beginSplitDrag;
+      nextSplitter.ontouchmove = moveSplitDrag;
+      nextSplitter.ontouchend = endSplitDrag;
+      nextSplitter.ontouchcancel = endSplitDrag;
+    }
+    nextSplitter.addEventListener("pointerenter", handleSplitterPointerEnter);
+    nextSplitter.addEventListener("pointerleave", handleSplitterPointerLeave);
+    const handleMainPointerEnter = () => {
+      syncToolbarVisibility(true);
+    };
+    const handleMainPointerLeave = () => {
+      syncToolbarVisibility(false);
+    };
+    main.section.addEventListener("pointerenter", handleMainPointerEnter);
+    main.section.addEventListener("pointerleave", handleMainPointerLeave);
+    cleanups.push(() => {
+      nextSplitter.removeEventListener("pointerenter", handleSplitterPointerEnter);
+      nextSplitter.removeEventListener("pointerleave", handleSplitterPointerLeave);
+      main.section.removeEventListener("pointerenter", handleMainPointerEnter);
+      main.section.removeEventListener("pointerleave", handleMainPointerLeave);
+    });
     syncSectionVisibility();
     schedule(undefined, true);
     return nextRoot;
@@ -717,10 +1228,19 @@ export function createSpectrumRenderController(
   }
 
   function destroy(): void {
+    if (documentRef?.fullscreenElement === mainSection && documentRef.exitFullscreen) {
+      void documentRef.exitFullscreen().catch(() => undefined);
+    }
     resizeObserver?.disconnect();
     resizeObserver = null;
     audioCleanup?.();
     audioCleanup = null;
+    while (cleanups.length > 0) {
+      const cleanup = cleanups.pop();
+      try {
+        cleanup?.();
+      } catch {}
+    }
     stopLoop();
     destroyHeatmapWorker();
     if (root?.parentElement) {
@@ -728,6 +1248,11 @@ export function createSpectrumRenderController(
     }
     root = null;
     placeholder = null;
+    splitBar = null;
+    splitBarHandle = null;
+    toolbar = null;
+    mainFullscreenToggle = null;
+    controlsVisible = false;
     mainSection = null;
     overviewSection = null;
     mainBase = null;
@@ -760,6 +1285,7 @@ export function createSpectrumRenderController(
     mount,
     attachAudioElement,
     setTimeline,
+    toggleMainFullscreen: setMainFullscreen,
     requestSpectrumRedraw,
     requestOverviewOverlayRedraw,
     runHeatmapBenchmark,
