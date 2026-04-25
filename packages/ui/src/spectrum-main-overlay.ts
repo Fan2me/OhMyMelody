@@ -1,9 +1,9 @@
 import type { SpectrumInteractionState, SpectrumUiState } from "./spectrum-state.js";
+import { getMainViewFrameCount } from "./spectrum-layout.js";
 import {
   getDisplayStrideFramesForZoom,
   pickRepresentativeIndex,
 } from "./display-sampling.js";
-import { getMainViewFrameCount } from "./spectrum-layout.js";
 
 export interface SpectrumOverlayCanvasRef {
   canvas: HTMLCanvasElement;
@@ -17,6 +17,7 @@ export interface SpectrumMainOverlayRendererDeps {
   getAudioElement: () => HTMLAudioElement | null;
   getPredictionFrames: () => ArrayLike<number> | readonly number[];
   getPredictionConfidence?: () => ArrayLike<number> | readonly number[] | null;
+  getPredictionRevision?: () => number;
 }
 
 export interface SpectrumMainOverlayRenderer {
@@ -27,7 +28,19 @@ const FRAME_SEC = 0.01;
 const BINS_PER_SEMITONE = 5;
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const AXIS_X = 0;
-const GUIDE_LINE_COLOR = "rgba(255,255,255,0.20)";
+
+type CachedPitchAxis = {
+  key: string;
+  canvas: HTMLCanvasElement;
+};
+
+type CachedPredictionSeries = {
+  key: string;
+  points: Array<{
+    centerFrame: number;
+    bin: number;
+  }>;
+};
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -82,7 +95,7 @@ function drawPitchAxis(
   const semitoneEnd = Math.floor(displayEnd / BINS_PER_SEMITONE);
 
   ctx.save();
-  ctx.strokeStyle = GUIDE_LINE_COLOR;
+  ctx.strokeStyle = "rgba(255,255,255,0.20)";
   ctx.lineWidth = 1;
   ctx.beginPath();
   for (let s = semitoneStart; s <= semitoneEnd; s += 1) {
@@ -104,14 +117,14 @@ function drawPitchAxis(
     if (bin < displayStart || bin > displayEnd) continue;
     const y = Math.round(plotH - (bin - displayStart + 0.5) * pixelPerBin);
     ctx.fillText(binToNoteName(bin), AXIS_X + 4, y);
-    ctx.strokeStyle = GUIDE_LINE_COLOR;
+    ctx.strokeStyle = "rgba(255,255,255,0.20)";
     ctx.beginPath();
     ctx.moveTo(AXIS_X, y);
     ctx.lineTo(AXIS_X + 6, y);
     ctx.stroke();
   }
 
-  ctx.strokeStyle = GUIDE_LINE_COLOR;
+  ctx.strokeStyle = "rgba(255,255,255,0.20)";
   ctx.beginPath();
   ctx.moveTo(AXIS_X + 0.5, 0);
   ctx.lineTo(AXIS_X + 0.5, plotH);
@@ -131,12 +144,6 @@ function drawTimeAxis(
   }
   const axisY = Math.max(0.5, height - 0.5);
   const plotW = Math.max(1, width - axisX);
-  ctx.strokeStyle = "rgba(255,255,255,0.16)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(axisX, axisY);
-  ctx.lineTo(width, axisY);
-  ctx.stroke();
 
   const targetTicks = Math.max(4, Math.floor(plotW / 80));
   const tickStep = niceTickStep(visibleTimeSec / targetTicks);
@@ -150,10 +157,6 @@ function drawTimeAxis(
       axisX +
       Math.round(((t - startTimeSec) / Math.max(1, visibleTimeSec)) * Math.max(0, plotW - 1)) +
       0.5;
-    ctx.beginPath();
-    ctx.moveTo(x, axisY);
-    ctx.lineTo(x, axisY - 6);
-    ctx.stroke();
     ctx.fillText(formatTimeLabel(t, 2), x, axisY - 8);
   }
 }
@@ -168,7 +171,117 @@ export function createSpectrumMainOverlayRenderer(
     getAudioElement,
     getPredictionFrames,
     getPredictionConfidence = () => null,
+    getPredictionRevision = () => 0,
   } = deps;
+  let cachedPitchAxis: CachedPitchAxis | null = null;
+  let cachedPredictionSeries: CachedPredictionSeries | null = null;
+
+  function drawPitchAxisCached(
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+    displayStart: number,
+    displayEnd: number,
+  ): void {
+    const safeWidth = Math.max(1, Math.round(width));
+    const safeHeight = Math.max(1, Math.round(height));
+    const key = `${safeWidth}x${safeHeight}:${displayStart}-${displayEnd}`;
+    if (!cachedPitchAxis || cachedPitchAxis.key !== key) {
+      const axisCanvas =
+        cachedPitchAxis?.canvas ??
+        (typeof document !== "undefined" ? document.createElement("canvas") : null);
+      if (!axisCanvas) {
+        drawPitchAxis(ctx, width, height, displayStart, displayEnd);
+        return;
+      }
+      axisCanvas.width = safeWidth;
+      axisCanvas.height = safeHeight;
+      const axisCtx = axisCanvas.getContext("2d");
+      if (!axisCtx) {
+        drawPitchAxis(ctx, width, height, displayStart, displayEnd);
+        return;
+      }
+      axisCtx.setTransform(1, 0, 0, 1, 0, 0);
+      axisCtx.clearRect(0, 0, axisCanvas.width, axisCanvas.height);
+      drawPitchAxis(axisCtx, width, height, displayStart, displayEnd);
+      cachedPitchAxis = {
+        key,
+        canvas: axisCanvas,
+      };
+    }
+    ctx.drawImage(cachedPitchAxis.canvas, 0, 0, width, height);
+  }
+
+  function buildPredictionSeriesKey(args: {
+    totalFrames: number;
+    stride: number;
+    representativeMode: string;
+    predictionRevision: number;
+    predictionFrames: ArrayLike<number> | readonly number[];
+    predictionConfidence: ArrayLike<number> | readonly number[] | null;
+  }): string {
+    const { totalFrames, stride, representativeMode, predictionRevision, predictionFrames, predictionConfidence } = args;
+    const frameLength = Math.max(0, Math.floor(Number(predictionFrames.length) || 0));
+    const confidenceLength = Math.max(0, Math.floor(Number(predictionConfidence?.length) || 0));
+    const frameFirst = frameLength > 0 ? Number(predictionFrames[0]) : NaN;
+    const frameMid = frameLength > 0 ? Number(predictionFrames[Math.floor(frameLength / 2)]) : NaN;
+    const frameLast = frameLength > 0 ? Number(predictionFrames[frameLength - 1]) : NaN;
+    const confFirst = confidenceLength > 0 ? Number(predictionConfidence?.[0]) : NaN;
+    const confMid = confidenceLength > 0 ? Number(predictionConfidence?.[Math.floor(confidenceLength / 2)]) : NaN;
+    const confLast = confidenceLength > 0 ? Number(predictionConfidence?.[confidenceLength - 1]) : NaN;
+    return [
+      `frames:${totalFrames}`,
+      `stride:${stride}`,
+      `rep:${representativeMode}`,
+      `rev:${predictionRevision}`,
+      `len:${frameLength}`,
+      `conf:${confidenceLength}`,
+      `sig:${frameFirst.toFixed(4)}|${frameMid.toFixed(4)}|${frameLast.toFixed(4)}`,
+      `csig:${confFirst.toFixed(4)}|${confMid.toFixed(4)}|${confLast.toFixed(4)}`,
+    ].join("|");
+  }
+
+  function getCachedPredictionSeries(args: {
+    totalFrames: number;
+    stride: number;
+    representativeMode: string;
+    predictionRevision: number;
+    predictionFrames: ArrayLike<number> | readonly number[];
+    predictionConfidence: ArrayLike<number> | readonly number[] | null;
+  }): CachedPredictionSeries {
+    const key = buildPredictionSeriesKey(args);
+    if (cachedPredictionSeries && cachedPredictionSeries.key === key) {
+      return cachedPredictionSeries;
+    }
+    const totalFrames = Math.max(1, Math.floor(Number(args.totalFrames) || 1));
+    const stride = Math.max(1, Math.floor(Number(args.stride) || 1));
+    const points: CachedPredictionSeries["points"] = [];
+    const confidenceAt = (idx: number): number => {
+      const value = args.predictionConfidence?.[idx];
+      return Number.isFinite(value) ? Number(value) : NaN;
+    };
+    const validAt = (idx: number): boolean => {
+      const value = args.predictionFrames[idx];
+      return Number.isFinite(value) && Number(value) >= 0;
+    };
+    for (let regionStart = 0; regionStart < totalFrames; regionStart += stride) {
+      const regionEnd = Math.min(totalFrames, regionStart + stride);
+      const frameIndex = pickRepresentativeIndex({
+        start: regionStart,
+        end: regionEnd,
+        mode: args.representativeMode,
+        isValidAt: validAt,
+        scoreAt: confidenceAt,
+      });
+      const rawBin = Number(args.predictionFrames[frameIndex]);
+      points.push({
+        centerFrame: (regionStart + regionEnd) * 0.5,
+        bin: Number.isFinite(rawBin) && rawBin >= 0 ? Math.floor(rawBin) : NaN,
+      });
+    }
+    cachedPredictionSeries = { key, points };
+    return cachedPredictionSeries;
+  }
 
   function drawOverlay(): void {
     const refs = getCanvas();
@@ -181,13 +294,23 @@ export function createSpectrumMainOverlayRenderer(
     const audioElement = getAudioElement();
 
     const dpr = window.devicePixelRatio || 1;
-    const w = canvas.width / dpr;
-    const h = canvas.height / dpr;
+    const w = Math.max(1, Math.round(canvas.width / dpr));
+    const h = Math.max(1, Math.round(canvas.height / dpr));
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
+    const spectrumBinCount = Math.max(1, Math.floor(interaction.spectrumH || 1));
+    const displayStart = Math.max(0, Math.min(spectrumBinCount - 1, Math.floor(state.pitchRange.minBin || 0)));
+    const displayEnd = Math.max(
+      displayStart,
+      Math.min(spectrumBinCount - 1, Math.floor(state.pitchRange.maxBin || (spectrumBinCount - 1))),
+    );
+    const plotH = Math.max(1, h);
+    const plotW = Math.max(1, w);
+    drawPitchAxisCached(ctx, w, h, displayStart, displayEnd);
+
     const predictionFrames = getPredictionFrames();
-    const predictionConfidence = getPredictionConfidence() || null;
+    const predictionConfidence = getPredictionConfidence?.() || null;
     const fallbackDuration =
       state.audio ? state.audio.pcm.length / Math.max(1, state.audio.fs) : 0;
     const totalFrames = Math.max(
@@ -207,36 +330,12 @@ export function createSpectrumMainOverlayRenderer(
       0,
       Math.max(0, totalFrames - viewW),
     );
-    const spectrumBinCount = Math.max(1, Math.floor(interaction.spectrumH || 1));
-    const displayStart = Math.max(0, Math.min(spectrumBinCount - 1, Math.floor(state.pitchRange.minBin || 0)));
-    const displayEnd = Math.max(
-      displayStart,
-      Math.min(spectrumBinCount - 1, Math.floor(state.pitchRange.maxBin || (spectrumBinCount - 1))),
-    );
-    const plotH = Math.max(1, h);
-    const plotW = Math.max(1, w);
-    const displayConfig = state.displaySampling;
-    const strideBase = Math.max(
-      1,
-      getDisplayStrideFramesForZoom({
-        zoom: interaction.spectrumZoom,
-        minZoom: 1,
-        // Use a practical zoom range so zoom->UPS mapping remains responsive.
-        maxZoom: 20,
-        minUnitsPerSecond: displayConfig.minUnitsPerSecond,
-        maxUnitsPerSecond: displayConfig.maxUnitsPerSecond,
-        frameRateHz: Math.max(1, Math.round(1 / FRAME_SEC)),
-      }),
-    );
-    const stride = strideBase;
-
     const currentTime = audioElement?.currentTime || 0;
     const playheadFrame = Math.max(0, currentTime / FRAME_SEC);
     if (Number.isFinite(playheadFrame) && playheadFrame >= offset && playheadFrame <= offset + viewW) {
-      const playheadX =
-        totalFrames > 1
-          ? Math.round(((playheadFrame - offset) / viewW) * plotW) + 0.5
-          : plotW * 0.5;
+      const playheadX = totalFrames > 1
+        ? Math.round(((playheadFrame - offset) / viewW) * plotW) + 0.5
+        : plotW * 0.5;
       ctx.beginPath();
       ctx.moveTo(playheadX, 0);
       ctx.lineTo(playheadX, h);
@@ -248,80 +347,52 @@ export function createSpectrumMainOverlayRenderer(
     }
 
     if (predictionFrames.length) {
+      const displayConfig = state.displaySampling;
+      const stride = Math.max(
+        1,
+        getDisplayStrideFramesForZoom({
+          zoom: interaction.spectrumZoom,
+          minZoom: 1,
+          maxZoom: 20,
+          minUnitsPerSecond: displayConfig.minUnitsPerSecond,
+          maxUnitsPerSecond: displayConfig.maxUnitsPerSecond,
+          frameRateHz: Math.max(1, Math.round(1 / FRAME_SEC)),
+        }),
+      );
+      const series = getCachedPredictionSeries({
+        totalFrames,
+        stride,
+        representativeMode: displayConfig.representativeMode,
+        predictionRevision: getPredictionRevision(),
+        predictionFrames,
+        predictionConfidence,
+      });
       ctx.beginPath();
       let drawing = false;
       const visibleStart = offset;
       const visibleEnd = Math.min(totalFrames, offset + viewW);
-      const confidenceAt = (idx: number): number => {
-        const value = predictionConfidence?.[idx];
-        return Number.isFinite(value) ? Number(value) : NaN;
-      };
-      const validAt = (idx: number): boolean => {
-        const value = predictionFrames[idx];
-        return Number.isFinite(value) && Number(value) >= 0;
-      };
-
-      if (stride === 1) {
-        for (let frame = visibleStart; frame < visibleEnd; frame += 1) {
-          const frameIndex = pickRepresentativeIndex({
-            start: frame,
-            end: Math.min(visibleEnd, frame + 1),
-            mode: displayConfig.representativeMode,
-            isValidAt: validAt,
-            scoreAt: confidenceAt,
-          });
-          const rawBin = Number(predictionFrames[frameIndex]);
-          if (!Number.isFinite(rawBin) || rawBin < 0) {
-            drawing = false;
-            continue;
-          }
-          const y = binToY(rawBin, plotH, displayStart, displayEnd);
-          if (y === null) {
-            drawing = false;
-            continue;
-          }
-          const x =
-            totalFrames > 1
-              ? ((((frame + 0.5) - offset) / viewW) * plotW)
-              : plotW * 0.5;
-          if (!drawing) {
-            ctx.moveTo(x, y);
-            drawing = true;
-          } else {
-            ctx.lineTo(x, y);
-          }
+      for (const point of series.points) {
+        if (point.centerFrame < visibleStart || point.centerFrame >= visibleEnd) {
+          continue;
         }
-      } else {
-        for (let regionStart = visibleStart; regionStart < visibleEnd; regionStart += stride) {
-          const regionEnd = Math.min(visibleEnd, regionStart + stride);
-          const frameIndex = pickRepresentativeIndex({
-            start: regionStart,
-            end: regionEnd,
-            mode: displayConfig.representativeMode,
-            isValidAt: validAt,
-            scoreAt: confidenceAt,
-          });
-          const rawBin = Number(predictionFrames[frameIndex]);
-          if (!Number.isFinite(rawBin) || rawBin < 0) {
-            drawing = false;
-            continue;
-          }
-          const y = binToY(rawBin, plotH, displayStart, displayEnd);
-          if (y === null) {
-            drawing = false;
-            continue;
-          }
-          const regionCenter = (regionStart + regionEnd) * 0.5;
-          const x =
-            totalFrames > 1
-              ? (((regionCenter - offset) / viewW) * plotW)
-              : plotW * 0.5;
-          if (!drawing) {
-            ctx.moveTo(x, y);
-            drawing = true;
-          } else {
-            ctx.lineTo(x, y);
-          }
+        if (!Number.isFinite(point.bin) || point.bin < 0) {
+          drawing = false;
+          continue;
+        }
+        const y = binToY(point.bin, plotH, displayStart, displayEnd);
+        if (y === null) {
+          drawing = false;
+          continue;
+        }
+        const x =
+          totalFrames > 1
+            ? (((point.centerFrame - offset) / viewW) * plotW)
+            : plotW * 0.5;
+        if (!drawing) {
+          ctx.moveTo(x, y);
+          drawing = true;
+        } else {
+          ctx.lineTo(x, y);
         }
       }
 
@@ -336,10 +407,9 @@ export function createSpectrumMainOverlayRenderer(
         const label = `${binToNoteName(curBin)} (bin=${curBin})`;
         const y = binToY(curBin, plotH, displayStart, displayEnd);
         if (y !== null) {
-          const x =
-            totalFrames > 1
-              ? Math.round(((frameIdx - offset) / viewW) * plotW) + 0.5
-              : plotW * 0.5;
+          const x = totalFrames > 1
+            ? Math.round(((frameIdx - offset) / viewW) * plotW) + 0.5
+            : plotW * 0.5;
           ctx.beginPath();
           ctx.arc(x, y, 5, 0, Math.PI * 2);
           ctx.fillStyle = "#ffd166";
@@ -364,7 +434,11 @@ export function createSpectrumMainOverlayRenderer(
       }
     }
 
-    if (interaction.spectrumHoverActive && interaction.spectrumHoverX !== null && interaction.spectrumHoverY !== null) {
+    if (
+      interaction.spectrumHoverActive &&
+      interaction.spectrumHoverX !== null &&
+      interaction.spectrumHoverY !== null
+    ) {
       const vx = Math.max(0, Math.min(w - 1, interaction.spectrumHoverX));
       const vy = Math.max(0, Math.min(h - 1, interaction.spectrumHoverY));
       ctx.beginPath();
@@ -413,7 +487,6 @@ export function createSpectrumMainOverlayRenderer(
       }
     }
 
-    drawPitchAxis(ctx, w, h, displayStart, displayEnd);
     const visibleTimeSec = Math.max(1 / 100, viewW * FRAME_SEC);
     const startTimeSec = Math.max(0, offset * FRAME_SEC);
     drawTimeAxis(ctx, w, h, AXIS_X, startTimeSec, visibleTimeSec);

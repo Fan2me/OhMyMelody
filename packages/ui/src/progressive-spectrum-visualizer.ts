@@ -9,6 +9,7 @@ export interface ProgressiveSpectrumState {
   windowFrameCount: number;
   predictionArgmax: Float32Array;
   predictionConfidence: Float32Array;
+  predictionRevision: number;
   writeFrameOffset: number;
   renderedFrames: number;
 }
@@ -157,6 +158,7 @@ export function createProgressiveSpectrumVisualizer(
     windowFrameCount: 0,
     predictionArgmax,
     predictionConfidence,
+    predictionRevision: 0,
     writeFrameOffset: 0,
     renderedFrames: 0,
   };
@@ -169,6 +171,7 @@ export function createProgressiveSpectrumVisualizer(
     if (Object.prototype.hasOwnProperty.call(next, "windowFrameCount")) state.windowFrameCount = next.windowFrameCount ?? state.windowFrameCount;
     if (Object.prototype.hasOwnProperty.call(next, "predictionArgmax")) state.predictionArgmax = next.predictionArgmax ?? state.predictionArgmax;
     if (Object.prototype.hasOwnProperty.call(next, "predictionConfidence")) state.predictionConfidence = next.predictionConfidence ?? state.predictionConfidence;
+    if (Object.prototype.hasOwnProperty.call(next, "predictionRevision")) state.predictionRevision = next.predictionRevision ?? state.predictionRevision;
     if (Object.prototype.hasOwnProperty.call(next, "writeFrameOffset")) state.writeFrameOffset = next.writeFrameOffset ?? state.writeFrameOffset;
     if (Object.prototype.hasOwnProperty.call(next, "renderedFrames")) state.renderedFrames = next.renderedFrames ?? state.renderedFrames;
   }
@@ -228,6 +231,7 @@ export function createProgressiveSpectrumVisualizer(
       spectrumH: blank.spectrumH,
       predictionArgmax,
       predictionConfidence,
+      predictionRevision: state.predictionRevision + 1,
       sourceFrameOffset: 0,
       windowFrameCount: 0,
       writeFrameOffset: 0,
@@ -351,6 +355,7 @@ export function createProgressiveSpectrumVisualizer(
         state.predictionConfidence[start + i] = Number(predictionConfidence[i] ?? 0);
       }
     }
+    state.predictionRevision += 1;
     state.renderedFrames = Math.max(state.renderedFrames, start + maxCopy);
     requestRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY, force: false });
   }
@@ -368,6 +373,7 @@ export function createProgressiveSpectrumVisualizer(
     state.windowFrameCount = 0;
     state.writeFrameOffset = 0;
     state.renderedFrames = 0;
+    state.predictionRevision += 1;
     if (typeof next.expectedFrames === "number" && next.expectedFrames > 0) {
       ensureBase(
         next.expectedFrames,
@@ -387,6 +393,7 @@ export function createProgressiveSpectrumVisualizer(
         spectrumH: height,
         predictionArgmax,
         predictionConfidence,
+        predictionRevision: state.predictionRevision,
       });
     }
   }

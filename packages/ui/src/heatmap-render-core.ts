@@ -1,4 +1,5 @@
 import type { CFPBatch } from "@ohm/core/cache/cfp.js";
+import { getModuleLogger } from "@ohm/core/logging/logger.js";
 import { pickRepresentativeIndex } from "./display-sampling.js";
 
 export type HeatmapTimelineSlot = readonly CFPBatch[] | null;
@@ -102,6 +103,30 @@ const HEATMAP_PALETTE_U32 = (() => {
 })();
 
 const BATCH_SUMMARY_CACHE = new WeakMap<CFPBatch, BatchSummary>();
+type HeatmapRenderContext = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+
+const HEATMAP_RENDER_CACHE = new WeakMap<HeatmapRenderContext, HeatmapRenderCache>();
+const BATCH_RENDER_ID_CACHE = new WeakMap<CFPBatch, number>();
+const heatmapRenderLogger = getModuleLogger("core.ui.heatmap.render");
+
+let nextBatchRenderId = 1;
+
+type HeatmapRenderCache = {
+  timelineKey: string;
+  width: number;
+  height: number;
+  viewportStart: number;
+  viewportEnd: number;
+  viewportMode: "slots" | "frames";
+  representativeMode: string;
+  sampleStrideFrames: number;
+  optimizationLevel: HeatmapOptimizationLevel;
+  minFreq: number;
+  maxFreq: number;
+  visibleMin: number;
+  visibleMax: number;
+  representativeFrameCache: Map<string, number>;
+};
 
 function summarizeBatch(batch: CFPBatch): BatchSummary {
   const cached = BATCH_SUMMARY_CACHE.get(batch);
@@ -308,6 +333,132 @@ function appendHeatmapRegion(
   }
   regions.push(next);
 }
+
+function getBatchRenderId(batch: CFPBatch): number {
+  const cached = BATCH_RENDER_ID_CACHE.get(batch);
+  if (typeof cached === "number") {
+    return cached;
+  }
+  const next = nextBatchRenderId;
+  nextBatchRenderId += 1;
+  BATCH_RENDER_ID_CACHE.set(batch, next);
+  return next;
+}
+
+function getSegmentRenderKey(segment: HeatmapTimelineSegment): string {
+  const batchIds = Array.isArray(segment.batches)
+    ? segment.batches.map((batch) => getBatchRenderId(batch)).join(",")
+    : "none";
+  return `slot:${segment.slotIndex}|frames:${segment.frameCount}|freq:${segment.freqCount}|batches:${batchIds}`;
+}
+
+function getTimelineRenderKey(timeline: HeatmapTimeline): string {
+  const segmentKeys = timeline.segments.map((segment) => getSegmentRenderKey(segment)).join(";");
+  return [
+    `slots:${timeline.totalSlots}`,
+    `frames:${timeline.totalFrames}`,
+    `freq:${timeline.freqCount}`,
+    `min:${timeline.min.toFixed(6)}`,
+    `max:${timeline.max.toFixed(6)}`,
+    `segments:${segmentKeys}`,
+  ].join("|");
+}
+
+function buildRepresentativeRegionCacheKey(args: {
+  viewportMode: "slots" | "frames";
+  representativeMode: string;
+  sampleStrideFrames: number;
+  segmentKey: string;
+  regionBucketStart: number;
+  regionBucketEnd: number;
+  minFreq: number;
+  maxFreq: number;
+  visibleMin: number;
+  visibleMax: number;
+}): string {
+  return [
+    `mode:${args.viewportMode}`,
+    `rep:${args.representativeMode}`,
+    `stride:${args.sampleStrideFrames}`,
+    `seg:${args.segmentKey}`,
+    `bucket:${args.regionBucketStart}-${args.regionBucketEnd}`,
+    `freq:${args.minFreq}-${args.maxFreq}`,
+    `value:${args.visibleMin.toFixed(6)}-${args.visibleMax.toFixed(6)}`,
+  ].join("|");
+}
+
+function resolveRepresentativeFrameIndex(args: {
+  segment: HeatmapTimelineSegment;
+  viewportMode: "slots" | "frames";
+  representativeMode: string;
+  sampleStrideFrames: number;
+  regionStartFrame: number;
+  regionEndFrame: number;
+  minFreq: number;
+  maxFreq: number;
+  visibleMin: number;
+  visibleMax: number;
+  cache: Map<string, number>;
+}): number {
+  const segmentKey = getSegmentRenderKey(args.segment);
+  const stride = Math.max(1, Math.floor(args.sampleStrideFrames) || 1);
+  const regionStart = Math.max(0, Math.floor(args.regionStartFrame));
+  const regionEnd = Math.max(regionStart + 1, Math.floor(args.regionEndFrame));
+  const bucketStart = Math.floor(regionStart / stride);
+  const bucketEnd = Math.floor((regionEnd - 1) / stride) + 1;
+  const cacheKey = buildRepresentativeRegionCacheKey({
+    viewportMode: args.viewportMode,
+    representativeMode: args.representativeMode,
+    sampleStrideFrames: stride,
+    segmentKey,
+    regionBucketStart: bucketStart,
+    regionBucketEnd: bucketEnd,
+    minFreq: args.minFreq,
+    maxFreq: args.maxFreq,
+    visibleMin: args.visibleMin,
+    visibleMax: args.visibleMax,
+  });
+  const cached = args.cache.get(cacheKey);
+  if (Number.isFinite(cached)) {
+    return Math.max(0, Math.floor(Number(cached)));
+  }
+  const picked = pickRepresentativeIndex({
+    start: regionStart,
+    end: regionEnd,
+    mode: args.representativeMode,
+  });
+  args.cache.set(cacheKey, picked);
+  return picked;
+}
+
+function paintHeatmapRegion(
+  data32: Uint32Array,
+  width: number,
+  height: number,
+  region: HeatmapXRegion,
+  yStarts: readonly number[],
+  yRowHeights: readonly number[],
+  yFreqIndexes: readonly number[],
+  minFreq: number,
+  visibleMin: number,
+  invValueSpan: number,
+  hasValueSpan: boolean,
+): void {
+  drawHeatmapRegion(
+    data32,
+    width,
+    height,
+    region,
+    yStarts,
+    yRowHeights,
+    yFreqIndexes,
+    minFreq,
+    visibleMin,
+    invValueSpan,
+    hasValueSpan,
+  );
+}
+
 
 function toPaletteIndex(normalized: number): number {
   if (normalized <= 0) return 0;
@@ -543,7 +694,10 @@ export function renderHeatmapTimeline(
     : fullMaxFreq;
   const visibleFreqCount = Math.max(1, maxFreq - minFreq + 1);
   const visibleFreqSpan = Math.max(0, visibleFreqCount - 1);
-  const yStepDraw = Math.max(1, Math.floor(visibleFreqCount / HEATMAP_MAX_DRAW_ROWS) || 1);
+  const yStepDraw = Math.max(
+    1,
+    Math.ceil(safeHeight / Math.max(1, HEATMAP_MAX_DRAW_ROWS)),
+  );
   const heightDenominator = Math.max(1, safeHeight - 1);
   const yStarts: number[] = [];
   const yRowHeights: number[] = [];
@@ -568,7 +722,86 @@ export function renderHeatmapTimeline(
   const hasValueSpan = valueSpan > 0;
   const invValueSpan = hasValueSpan ? 1 / valueSpan : 0;
   const minSampleStride = Math.max(1, Math.floor(Number(sampleStrideFrames) || 1));
-
+  const canUseRegionCache = viewportMode !== "frames";
+  const previousCache = canUseRegionCache ? HEATMAP_RENDER_CACHE.get(ctx) ?? null : null;
+  const timelineKey = getTimelineRenderKey(safeTimeline);
+  const viewportMoved =
+    !!previousCache &&
+    previousCache.viewportMode === viewportMode &&
+    viewport
+      ? Math.floor(Number(viewport.startSlot) || 0) !== previousCache.viewportStart
+      : false;
+  const cacheIsCompatible =
+    !!previousCache &&
+    previousCache.timelineKey === timelineKey &&
+    previousCache.width === safeWidth &&
+    previousCache.height === safeHeight &&
+    previousCache.viewportMode === viewportMode &&
+    previousCache.representativeMode === representativeMode &&
+    previousCache.sampleStrideFrames === minSampleStride &&
+    previousCache.optimizationLevel === optimizationLevel &&
+    previousCache.minFreq === minFreq &&
+    previousCache.maxFreq === maxFreq &&
+    previousCache.visibleMin === visibleMin &&
+    previousCache.visibleMax === visibleMax;
+  let resolvedViewportStart = 0;
+  let resolvedViewportEnd = 0;
+  const representativeFrameCache =
+    cacheIsCompatible && previousCache
+      ? new Map(previousCache.representativeFrameCache)
+      : new Map<string, number>();
+  let firstDebugRegion: {
+    segmentKey: string;
+    xStart: number;
+    xEnd: number;
+    regionStartFrame: number;
+    regionEndFrame: number;
+    localFrame: number;
+    batchLocalFrame: number;
+    batchFrameCount: number;
+    sampleStrideFrames: number;
+    viewportMoved: boolean;
+    frameBias: number;
+    regionBucketStart: number;
+    regionBucketEnd: number;
+  } | null = null;
+  let debugProbeRegions: Array<{
+    probeX: number;
+    segmentKey: string;
+    xStart: number;
+    xEnd: number;
+    regionStartFrame: number;
+    regionEndFrame: number;
+    localFrame: number;
+    batchLocalFrame: number;
+    batchFrameCount: number;
+    sampleStrideFrames: number;
+    viewportMoved: boolean;
+    frameBias: number;
+    regionBucketStart: number;
+    regionBucketEnd: number;
+  }> = [];
+  let visibleProbeRegions: Array<{
+    probeX: number;
+    segmentKey: string;
+    xStart: number;
+    xEnd: number;
+    regionStartFrame: number;
+    regionEndFrame: number;
+    localFrame: number;
+    batchLocalFrame: number;
+    batchFrameCount: number;
+    sampleStrideFrames: number;
+    viewportMoved: boolean;
+    frameBias: number;
+    regionBucketStart: number;
+    regionBucketEnd: number;
+  }> = [];
+  const visibleProbeXs = [
+    Math.max(0, Math.floor(safeWidth * 0.1)),
+    Math.max(0, Math.floor(safeWidth * 0.5)),
+    Math.max(0, Math.floor(safeWidth * 0.9)),
+  ];
   if (viewportMode === "frames") {
     const totalFrames = Math.max(1, safeTimeline.totalFrames || 0);
     const rawStartFrame = viewport
@@ -580,8 +813,11 @@ export function renderHeatmapTimeline(
       : totalFrames;
     const endFrame = Math.max(startFrame + 1, rawEndFrame);
     const visibleFrames = Math.max(1, endFrame - startFrame);
-    const sampleStep = Math.max(1, minSampleStride);
-
+    const sampleStride = Math.max(1, minSampleStride);
+    const currentViewportStart = startFrame;
+    const currentViewportEnd = endFrame;
+    resolvedViewportStart = currentViewportStart;
+    resolvedViewportEnd = currentViewportEnd;
     let frameCursor = 0;
     for (const segment of safeTimeline.segments) {
       const segFrameStart = frameCursor;
@@ -603,38 +839,65 @@ export function renderHeatmapTimeline(
               visStartPx + 1,
               Math.floor(((visEnd - startFrame) / visibleFrames) * safeWidth),
             );
-      const spanPx = Math.max(1, visEndPx - visStartPx);
-      const segVisibleFrames = Math.max(1, visEnd - visStart);
-      const framesPerPixel = segVisibleFrames / Math.max(1, spanPx);
-      const xStepPx = Math.max(
-        1,
-        Math.floor(sampleStep / Math.max(1e-6, framesPerPixel)),
-      );
+      const framesPerPixel = Math.max(1e-6, visibleFrames / Math.max(1, safeWidth));
+      const xStepPx = Math.max(1, Math.floor(sampleStride / framesPerPixel));
       const regions: HeatmapXRegion[] = [];
-
       for (let x = visStartPx; x < visEndPx; x += xStepPx) {
         const xEnd = Math.min(visEndPx, x + xStepPx);
-        const localSpan = Math.max(1, spanPx - 1);
         const xCenter = x + (xEnd - x) * 0.5;
-        const regionStartFrame = Math.max(
-          visStart,
+        const globalProgress = clampNumber(
+          (xCenter - 0.5) / Math.max(1, safeWidth),
+          0,
+          1,
+        );
+        const exactFrame = Math.max(
+          startFrame,
           Math.min(
-            visEnd - 1,
-            Math.floor(
-              visStart +
-                ((xCenter - visStartPx) / localSpan) * Math.max(1, visEnd - visStart - 1),
-            ),
+            endFrame - 1,
+            Math.round(startFrame + globalProgress * Math.max(1, visibleFrames - 1)),
           ),
         );
-        const regionEndFrame = Math.max(
-          regionStartFrame + 1,
-          Math.min(visEnd, regionStartFrame + sampleStep),
+        if (exactFrame < segFrameStart || exactFrame >= segFrameEnd) {
+          continue;
+        }
+        const frameBias = 0;
+        const regionStartFrame = Math.max(
+          segFrameStart,
+          Math.min(segFrameEnd - 1, Math.floor(exactFrame / sampleStride) * sampleStride),
         );
-        const localFrame = pickRepresentativeIndex({
-          start: Math.max(segFrameStart, regionStartFrame),
-          end: Math.min(segFrameEnd, regionEndFrame),
-          mode: representativeMode,
+        const regionEndFrame = Math.min(segFrameEnd, regionStartFrame + sampleStride);
+        const regionBucketStart = Math.floor(regionStartFrame / sampleStride);
+        const regionBucketEnd = Math.floor(Math.max(regionStartFrame, regionEndFrame - 1) / sampleStride) + 1;
+        const localFrame = resolveRepresentativeFrameIndex({
+          segment,
+          viewportMode,
+          representativeMode,
+          sampleStrideFrames: sampleStride,
+          regionStartFrame,
+          regionEndFrame,
+          minFreq,
+          maxFreq,
+          visibleMin,
+          visibleMax,
+          cache: representativeFrameCache,
         });
+        if (!firstDebugRegion) {
+          firstDebugRegion = {
+          segmentKey: getSegmentRenderKey(segment),
+          xStart: x,
+          xEnd,
+          regionStartFrame,
+          regionEndFrame,
+          localFrame,
+          batchLocalFrame: Math.max(0, localFrame - segFrameStart),
+          batchFrameCount: segment.frameCount,
+          sampleStrideFrames: sampleStride,
+          viewportMoved,
+          frameBias,
+          regionBucketStart,
+          regionBucketEnd,
+        };
+      }
         const {
           batch,
           batchFrameCount,
@@ -666,7 +929,7 @@ export function renderHeatmapTimeline(
       }
 
       for (let i = 0; i < regions.length; i += 1) {
-        drawHeatmapRegion(
+        paintHeatmapRegion(
           data32,
           safeWidth,
           safeHeight,
@@ -694,6 +957,10 @@ export function renderHeatmapTimeline(
         )
       : totalSlots;
     const visibleSlots = Math.max(1, endSlot - startSlot);
+    const currentViewportStart = startSlot;
+    const currentViewportEnd = endSlot;
+    resolvedViewportStart = currentViewportStart;
+    resolvedViewportEnd = currentViewportEnd;
 
     for (let slotIndex = startSlot; slotIndex < endSlot; slotIndex += 1) {
       const segment = safeTimeline.segments[slotIndex];
@@ -722,26 +989,81 @@ export function renderHeatmapTimeline(
       const regions: HeatmapXRegion[] = [];
       for (let x = slotStartPx; x < slotEndPx; x += xStepPx) {
         const xEnd = Math.min(slotEndPx, x + xStepPx);
-        const localSpan = Math.max(1, slotSpanPx - 1);
         const xCenter = x + (xEnd - x) * 0.5;
+        const contentProgress = clampNumber(
+          (xCenter - slotStartPx) / Math.max(1, slotSpanPx - 1),
+          0,
+          1,
+        );
         const regionStartFrame = Math.max(
           0,
           Math.min(
             Math.max(0, segment.frameCount - 1),
-            Math.floor(
-              ((xCenter - slotStartPx) / localSpan) * Math.max(1, segment.frameCount - 1),
+            Math.round(
+              contentProgress * Math.max(1, segment.frameCount - 1),
             ),
           ),
         );
+        const frameBias = 0;
         const regionEndFrame = Math.max(
           regionStartFrame + 1,
-          Math.min(segment.frameCount, regionStartFrame + sampleStep),
+          Math.min(segment.frameCount, regionStartFrame + sampleStep + frameBias),
         );
-        const localFrame = pickRepresentativeIndex({
-          start: regionStartFrame,
-          end: regionEndFrame,
-          mode: representativeMode,
+        const localFrame = resolveRepresentativeFrameIndex({
+          segment,
+          viewportMode,
+          representativeMode,
+          sampleStrideFrames: minSampleStride,
+          regionStartFrame: Math.min(
+            Math.max(0, segment.frameCount - 1),
+            regionStartFrame + frameBias,
+          ),
+          regionEndFrame,
+          minFreq,
+          maxFreq,
+          visibleMin,
+          visibleMax,
+          cache: representativeFrameCache,
         });
+        if (!firstDebugRegion) {
+          const regionBucketStart = Math.floor(regionStartFrame / minSampleStride);
+          const regionBucketEnd =
+            Math.floor(Math.max(regionStartFrame, regionEndFrame - 1) / minSampleStride) + 1;
+          firstDebugRegion = {
+            segmentKey: getSegmentRenderKey(segment),
+            xStart: x,
+            xEnd,
+            regionStartFrame,
+            regionEndFrame,
+            localFrame,
+            batchLocalFrame: localFrame,
+            batchFrameCount: segment.frameCount,
+            sampleStrideFrames: minSampleStride,
+            viewportMoved,
+            frameBias,
+            regionBucketStart,
+            regionBucketEnd,
+          };
+        }
+        if (visibleProbeXs.includes(x) && !visibleProbeRegions.some((probe) => probe.probeX === x)) {
+          visibleProbeRegions.push({
+            probeX: x,
+            segmentKey: getSegmentRenderKey(segment),
+            xStart: x,
+            xEnd,
+            regionStartFrame,
+            regionEndFrame,
+            localFrame,
+            batchLocalFrame: localFrame,
+            batchFrameCount: segment.frameCount,
+            sampleStrideFrames: minSampleStride,
+            viewportMoved,
+            frameBias,
+            regionBucketStart: Math.floor(regionStartFrame / minSampleStride),
+            regionBucketEnd:
+              Math.floor(Math.max(regionStartFrame, regionEndFrame - 1) / minSampleStride) + 1,
+          });
+        }
         const {
           batch,
           batchFrameCount,
@@ -773,7 +1095,7 @@ export function renderHeatmapTimeline(
       }
 
       for (let i = 0; i < regions.length; i += 1) {
-        drawHeatmapRegion(
+        paintHeatmapRegion(
           data32,
           safeWidth,
           safeHeight,
@@ -790,63 +1112,40 @@ export function renderHeatmapTimeline(
     }
   }
 
+  if (viewportMode === "frames") {
+    heatmapRenderLogger.info("heatmap frames render", {
+      viewportStart: resolvedViewportStart,
+      viewportEnd: resolvedViewportEnd,
+      sampleStrideFrames: minSampleStride,
+      viewportMoved,
+      cacheHit: cacheIsCompatible && !!previousCache,
+      firstRegion: firstDebugRegion,
+      probeRegions: debugProbeRegions,
+      visibleProbeRegions,
+    });
+  }
+
   ctx.putImageData(image, 0, 0);
+  if (canUseRegionCache) {
+    HEATMAP_RENDER_CACHE.set(ctx, {
+      timelineKey,
+      width: safeWidth,
+      height: safeHeight,
+      viewportStart: resolvedViewportStart,
+      viewportEnd: resolvedViewportEnd,
+      viewportMode,
+      representativeMode,
+      sampleStrideFrames: minSampleStride,
+      optimizationLevel,
+      minFreq,
+      maxFreq,
+      visibleMin,
+      visibleMax,
+      representativeFrameCache,
+    });
+  }
 
   ctx.save?.();
-  try {
-    if ("strokeStyle" in ctx) {
-      ctx.strokeStyle = "rgba(255,255,255,0.05)";
-      ctx.lineWidth = 1;
-      if (viewportMode === "frames") {
-        const totalFrames = Math.max(1, safeTimeline.totalFrames || 0);
-        const rawStartFrame = viewport
-          ? Math.floor(Number(viewport.startSlot) || 0)
-          : 0;
-        const startFrame = Math.max(0, rawStartFrame);
-        const rawEndFrame = viewport
-          ? Math.floor(Number(viewport.endSlot) || totalFrames)
-          : totalFrames;
-        const endFrame = Math.max(startFrame + 1, rawEndFrame);
-        const visibleFrames = Math.max(1, endFrame - startFrame);
-        let frameCursor = 0;
-        ctx.beginPath();
-        for (const segment of safeTimeline.segments) {
-          const segFrameStart = frameCursor;
-          frameCursor += Math.max(0, segment.frameCount);
-          const segFrameEnd = frameCursor;
-          const visStart = Math.max(startFrame, segFrameStart);
-          const visEnd = Math.min(endFrame, segFrameEnd);
-          if (visEnd <= visStart) continue;
-          const x =
-            Math.round(((visStart - startFrame) / visibleFrames) * safeWidth) + 0.5;
-          ctx.moveTo(x, 0);
-          ctx.lineTo(x, safeHeight);
-        }
-        ctx.stroke();
-      } else {
-        const totalSlots = Math.max(1, safeTimeline.totalSlots);
-        const startSlot = viewport
-          ? clampNumber(Math.floor(Number(viewport.startSlot) || 0), 0, Math.max(0, totalSlots - 1))
-          : 0;
-        const endSlot = viewport
-          ? clampNumber(
-              Math.floor(Number(viewport.endSlot) || totalSlots),
-              Math.min(totalSlots, startSlot + 1),
-              totalSlots,
-            )
-          : totalSlots;
-        const visibleSlots = Math.max(1, endSlot - startSlot);
-        ctx.beginPath();
-        for (let slotIndex = startSlot + 1; slotIndex < endSlot; slotIndex += 1) {
-          const x =
-            Math.round(((slotIndex - startSlot) / visibleSlots) * safeWidth) + 0.5;
-          ctx.moveTo(x, 0);
-          ctx.lineTo(x, safeHeight);
-        }
-        ctx.stroke();
-      }
-    }
-  } catch {}
   try {
     ctx.restore?.();
   } catch {}
@@ -882,6 +1181,9 @@ export function benchmarkHeatmapTimelineRender(
     let totalMs = 0;
     const totalRounds = Math.max(1, Math.floor(Number(rounds) || 1));
     for (let i = 0; i < totalRounds; i += 1) {
+      if (ctx) {
+        HEATMAP_RENDER_CACHE.delete(ctx);
+      }
       const t0 = now();
       renderHeatmapTimeline(
         ctx,
