@@ -13,9 +13,7 @@ export interface SpectrumInteractionControllerDeps {
   setState: (partial: Partial<SpectrumInteractionState>) => void;
   seekAudioTime: (timeSec: number) => void | Promise<void>;
   markAutoPanSuppressed: (nowTs?: number, durationMs?: number) => void;
-  requestSpectrumRedraw: (
-    next?: boolean | { force?: boolean; includeOverviewBase?: boolean; dirtyMask?: number },
-  ) => void;
+  requestSpectrumRedraw: (next?: { includeOverviewBase?: boolean; dirtyMask?: number }) => void;
   requestOverviewOverlayRedraw: () => void;
 }
 
@@ -149,7 +147,8 @@ export function createSpectrumInteractionController(
       activePointers.clear();
       clearMainInteractionState();
       clearOverviewInteractionState();
-      requestSpectrumRedraw(true);
+      // Don't force full base redraw on blur/visibility — only refresh overlays
+      requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
     };
 
     const buildPinchGesture = (points: Array<{ clientX: number; clientY: number }>) => {
@@ -204,7 +203,7 @@ export function createSpectrumInteractionController(
         spectrumZoom: clampedZoom,
         spectrumOffset: nextOffset,
       });
-      requestSpectrumRedraw(true);
+      requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
       return true;
     };
 
@@ -224,7 +223,7 @@ export function createSpectrumInteractionController(
         spectrumHoverX: null,
         spectrumHoverY: null,
       });
-      requestSpectrumRedraw(true);
+      requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
       return true;
     };
 
@@ -395,14 +394,14 @@ export function createSpectrumInteractionController(
         }
         clearPinchGesture();
         clearMainInteractionState();
-        requestSpectrumRedraw(true);
+        requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
         return;
       }
       if (state.spectrumDragging) {
         if (commit) handleDrag(e);
         clearMainInteractionState();
         updateMainCursor();
-        requestSpectrumRedraw(true);
+        requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
       }
     };
 
@@ -416,7 +415,7 @@ export function createSpectrumInteractionController(
         spectrumHoverY: null,
       });
       updateMainCursor();
-      requestSpectrumRedraw(true);
+      requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
     };
 
     targetCanvas.onpointerdown = null;
@@ -440,7 +439,7 @@ export function createSpectrumInteractionController(
       targetCanvas.onpointercancel = (e) => {
         stopInteraction(e, { commit: false });
         clearMainInteractionState();
-        requestSpectrumRedraw(true);
+        requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
       };
       targetCanvas.onpointerleave = leaveSpectrumHover;
     } else {
@@ -449,7 +448,7 @@ export function createSpectrumInteractionController(
       targetCanvas.onmouseup = (e) => stopInteraction(e, { commit: true });
       targetCanvas.onmouseleave = () => {
         clearMainInteractionState();
-        requestSpectrumRedraw(true);
+        requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
       };
       targetCanvas.ontouchstart = startInteraction;
       targetCanvas.ontouchmove = moveInteraction;
@@ -457,7 +456,7 @@ export function createSpectrumInteractionController(
       targetCanvas.ontouchcancel = () => {
         stopInteraction(null, { commit: false });
         clearMainInteractionState();
-        requestSpectrumRedraw(true);
+        requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY });
       };
     }
 
@@ -601,7 +600,7 @@ export function createSpectrumInteractionController(
       const nextState = getState();
       if (nextState.spectrumOffset === prevOffset && nextState.spectrumZoom === prevZoom) return;
       requestOverviewOverlayRedraw();
-      requestSpectrumRedraw(true);
+      requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY });
       updateOverviewCursor(point);
     };
 

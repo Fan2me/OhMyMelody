@@ -110,6 +110,39 @@ export interface SpectrumUiDebugState {
     frameBin: number | null;
     frameY: number | null;
   };
+  render: {
+    mainBase: SpectrumUiDebugRenderCanvasState;
+    mainOverlay: SpectrumUiDebugTaskState;
+    overviewBase: SpectrumUiDebugRenderCanvasState;
+    overviewOverlay: SpectrumUiDebugTaskState;
+    dirty: SpectrumUiDebugDirtyState;
+  };
+}
+
+export interface SpectrumUiDebugTaskState {
+  targetFps: number;
+  actualFps: number;
+  runCount: number;
+  nextRunInMs: number;
+}
+
+export interface SpectrumUiDebugRenderCanvasState extends SpectrumUiDebugTaskState {
+  canvasWidth: number;
+  canvasHeight: number;
+  dpr: number;
+  rows: number;
+  cols: number;
+  sampleStrideFrames: number;
+}
+
+export interface SpectrumUiDebugDirtyState {
+  currentMask: number;
+  mainBase: number;
+  mainOverlay: number;
+  overviewBase: number;
+  overviewOverlay: number;
+  playing: boolean;
+  schedulerRunning: boolean;
 }
 
 export interface SpectrumUi {

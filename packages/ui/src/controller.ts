@@ -8,6 +8,7 @@ import {
 import { buildSpectrumTimeline } from "./heatmap-render-core.js";
 import {
   type DisplaySamplingConfig,
+  getDisplayStrideFramesForZoom,
 } from "./display-sampling.js";
 import { getMainViewFrameCount } from "./spectrum-layout.js";
 import {
@@ -24,6 +25,9 @@ import {
   type SpectrumUiOptions,
   type SpectrumUiState,
   type SpectrumUiDebugState,
+  type SpectrumUiDebugRenderCanvasState,
+  type SpectrumUiDebugDirtyState,
+  type SpectrumUiDebugTaskState,
   type SpectrumUi,
   type SpectrumPitchRange,
   DEFAULT_MAIN_FPS,
@@ -34,7 +38,9 @@ import { createSpectrumMainOverlayRenderer } from "./spectrum-main-overlay.js";
 import { createSpectrumOverviewOverlayRenderer } from "./spectrum-overview-overlay.js";
 import {
   createSpectrumRenderController,
+  type SpectrumRenderCanvasStats,
   type SpectrumRenderController,
+  type SpectrumRenderTaskStats,
 } from "./spectrum-render.js";
 import {
   createProgressiveSpectrumVisualizer,
@@ -321,16 +327,16 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
 
   progressiveVisualizer = createProgressiveSpectrumVisualizer({
     setSpectrumPayload: () => {
-      renderController.requestSpectrumRedraw({ force: true, includeOverviewBase: false });
+      renderController.requestSpectrumRedraw({ includeOverviewBase: false });
     },
     setSpectrumDuration: (duration: number) => {
       interactionState.spectrumDuration = Math.max(0, duration);
     },
     requestSpectrumRedraw: (next) => {
-      renderController.requestSpectrumRedraw(next);
+      renderController.requestSpectrumRedraw(next as any);
     },
     markSpectrumDataDirty: () => {
-      renderController.requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_BASE, force: false });
+      renderController.requestSpectrumRedraw({ dirtyMask: DIRTY.MAIN_BASE });
     },
     frameSec: FRAME_SEC,
     maxWindowFrames: 240000,
@@ -453,7 +459,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     options.onStateChange?.(snapshot);
     options.onRender?.(mountTarget, snapshot);
     if (redrawMask > 0) {
-      renderController.requestSpectrumRedraw({ dirtyMask: redrawMask, force: false });
+      renderController.requestSpectrumRedraw({ dirtyMask: redrawMask });
     }
     return snapshot;
   }
@@ -464,7 +470,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     if (audioElement) {
       renderController.attachAudioElement(audioElement);
     }
-    renderController.requestSpectrumRedraw({ force: true });
+    renderController.requestSpectrumRedraw();
   }
 
   function updateSections(
@@ -719,7 +725,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
         : new Error(getCancelMessage(reason)),
     );
     emit({ status: "cancelled", message: getCancelMessage(reason) });
-    renderController.requestSpectrumRedraw({ force: true });
+    renderController.requestSpectrumRedraw();
   }
 
   function destroy(reason: unknown = "UI controller destroyed"): void {
@@ -745,7 +751,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     audioElement = nextAudioElement;
     emit({ audioElement }, DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY);
     renderController.attachAudioElement(audioElement);
-    renderController.requestSpectrumRedraw({ force: true });
+    renderController.requestSpectrumRedraw();
   }
 
   function setRefreshRate(
@@ -777,7 +783,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
         : state.sections.overview.overlayFps || state.sections.overview.fps || DEFAULT_OVERVIEW_FPS;
     }
     emit({ sections: state.sections }, DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_BASE | DIRTY.OVERVIEW_OVERLAY);
-    renderController.requestSpectrumRedraw({ force: true });
+    renderController.requestSpectrumRedraw();
   }
 
   function setDisplaySampling(
@@ -788,7 +794,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
       ...next,
     };
     emit({ displaySampling: state.displaySampling }, DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_BASE | DIRTY.OVERVIEW_OVERLAY);
-    renderController.requestSpectrumRedraw({ force: true });
+    renderController.requestSpectrumRedraw();
   }
 
   function setSections(
@@ -799,7 +805,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
   ): void {
     updateSections(next);
     emit({ sections: state.sections }, DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_BASE | DIRTY.OVERVIEW_OVERLAY);
-    renderController.requestSpectrumRedraw({ force: true });
+    renderController.requestSpectrumRedraw();
   }
 
   function subscribe(listener: (state: SpectrumUiState) => void): () => void {
@@ -842,6 +848,29 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     const displayMinBin = Math.max(0, Math.min(totalBins - 1, Math.floor(state.pitchRange.minBin || 0)));
     const displayMaxBin = Math.max(displayMinBin, Math.min(totalBins - 1, Math.floor(state.pitchRange.maxBin || (totalBins - 1))));
     const displayBinCount = Math.max(1, displayMaxBin - displayMinBin + 1);
+    const mainSampleStrideFrames = Math.max(
+      1,
+      getDisplayStrideFramesForZoom({
+        zoom: interactionState.spectrumZoom,
+        minZoom: 1,
+        maxZoom: 20,
+        minUnitsPerSecond: state.displaySampling.minUnitsPerSecond,
+        maxUnitsPerSecond: state.displaySampling.maxUnitsPerSecond,
+        frameRateHz: 100,
+      }),
+    );
+
+    const overviewSampleStrideFrames = Math.max(
+      1,
+      getDisplayStrideFramesForZoom({
+        zoom: 1,
+        minZoom: 1,
+        maxZoom: 20,
+        minUnitsPerSecond: 1,
+        maxUnitsPerSecond: state.displaySampling.maxUnitsPerSecond,
+        frameRateHz: 100,
+      }),
+    );
 
     const overlayCanvas = renderController.getMainOverlayCanvas();
     const dpr = Math.max(1, windowRef?.devicePixelRatio || 1);
@@ -849,6 +878,11 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     const canvasH = Math.max(1, (overlayCanvas?.height || overlayCanvas?.clientHeight || 1) / dpr);
     const xPerFrame = canvasW / Math.max(1, viewFrames);
     const yPerBin = canvasH / displayBinCount;
+    const renderStats = renderController.getRenderStats();
+    const mainBaseRows = displayBinCount;
+    const overviewBaseRows = displayBinCount;
+    const mainBaseCols = Math.max(1, Math.ceil(viewFrames / mainSampleStrideFrames));
+    const overviewBaseCols = Math.max(1, Math.ceil(totalFrames / overviewSampleStrideFrames));
 
     const hoverFrame = Number.isFinite(interactionState.spectrumHoverFrame)
       ? Math.max(0, Math.min(totalFrames - 1, Math.floor(interactionState.spectrumHoverFrame)))
@@ -869,6 +903,37 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
       : hoverFrameBin < displayMinBin || hoverFrameBin > displayMaxBin
         ? null
         : canvasH - (hoverFrameBin - displayMinBin + 0.5) * (canvasH / displayBinCount);
+
+    const toTaskStats = (stats: SpectrumRenderTaskStats): SpectrumUiDebugTaskState => ({
+      targetFps: Math.max(0, Number(stats.targetFps) || 0),
+      actualFps: Math.max(0, Number(stats.actualFps) || 0),
+      runCount: Math.max(0, Number(stats.runCount) || 0),
+      nextRunInMs: Math.max(0, Number(stats.nextRunInMs) || 0),
+    });
+    const toCanvasStats = (
+      stats: SpectrumRenderCanvasStats,
+      rows: number,
+      cols: number,
+      sampleStrideFrames: number,
+    ): SpectrumUiDebugRenderCanvasState => ({
+      ...toTaskStats(stats),
+      canvasWidth: Math.max(0, Number(stats.canvasWidth) || 0),
+      canvasHeight: Math.max(0, Number(stats.canvasHeight) || 0),
+      dpr: Math.max(1, Number(stats.dpr) || 1),
+      rows: Math.max(1, rows),
+      cols: Math.max(1, cols),
+      sampleStrideFrames: Math.max(1, sampleStrideFrames),
+    });
+    const dirty = renderStats.dirty;
+    const toDirtyState = (stats: typeof dirty): SpectrumUiDebugDirtyState => ({
+      currentMask: Math.max(0, Number(stats.currentMask) || 0),
+      mainBase: (stats.currentMask & DIRTY.MAIN_BASE) !== 0 ? 1 : 0,
+      mainOverlay: (stats.currentMask & DIRTY.MAIN_OVERLAY) !== 0 ? 1 : 0,
+      overviewBase: (stats.currentMask & DIRTY.OVERVIEW_BASE) !== 0 ? 1 : 0,
+      overviewOverlay: (stats.currentMask & DIRTY.OVERVIEW_OVERLAY) !== 0 ? 1 : 0,
+      playing: !!stats.playing,
+      schedulerRunning: !!stats.schedulerRunning,
+    });
 
     return {
       timing: {
@@ -903,6 +968,13 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
         frameBin: hoverFrameBin,
         frameY: hoverFrameY,
       },
+      render: {
+        mainBase: toCanvasStats(renderStats.mainBase, mainBaseRows, mainBaseCols, mainSampleStrideFrames),
+        mainOverlay: toTaskStats(renderStats.mainOverlay),
+        overviewBase: toCanvasStats(renderStats.overviewBase, overviewBaseRows, overviewBaseCols, overviewSampleStrideFrames),
+        overviewOverlay: toTaskStats(renderStats.overviewOverlay),
+        dirty: toDirtyState(dirty),
+      },
     };
   }
 
@@ -922,7 +994,7 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
       { pitchRange: state.pitchRange },
       DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_BASE | DIRTY.OVERVIEW_OVERLAY,
     );
-    renderController.requestSpectrumRedraw({ force: true });
+    renderController.requestSpectrumRedraw();
   }
 
   function runHeatmapBenchmark(rounds = 3) {

@@ -23,7 +23,6 @@ export interface ProgressiveSpectrumPayload {
 }
 
 export interface SpectrumRedrawRequest {
-  force?: boolean;
   includeOverviewBase?: boolean;
   dirtyMask?: number;
 }
@@ -31,7 +30,7 @@ export interface SpectrumRedrawRequest {
 export interface ProgressiveSpectrumVisualizerOptions {
   setSpectrumPayload?: ((payload: ProgressiveSpectrumPayload) => void) | null;
   setSpectrumDuration?: ((duration: number) => void) | null;
-  requestSpectrumRedraw?: ((full?: boolean | SpectrumRedrawRequest) => void) | null;
+  requestSpectrumRedraw?: ((opts?: SpectrumRedrawRequest) => void) | null;
   markSpectrumDataDirty?: (() => void) | null;
   frameSec?: number;
   maxWindowFrames?: number;
@@ -196,7 +195,11 @@ export function createProgressiveSpectrumVisualizer(
 
   function requestRedraw(fullOrOptions: boolean | SpectrumRedrawRequest = false): void {
     if (typeof requestSpectrumRedraw !== "function") return;
-    requestSpectrumRedraw(fullOrOptions);
+    if (typeof fullOrOptions === "boolean") {
+      requestSpectrumRedraw();
+    } else {
+      requestSpectrumRedraw(fullOrOptions);
+    }
   }
 
   function ensureBase(expectedFrames: number, durationSec = 0, pushToUi = true, preserveExisting = true) {
@@ -254,7 +257,7 @@ export function createProgressiveSpectrumVisualizer(
         argmax: blank.predictionArgmax,
         confidence: blank.predictionConfidence,
       });
-      requestRedraw({ force: true, includeOverviewBase: true });
+      requestRedraw({ includeOverviewBase: true });
     }
   }
 
@@ -325,7 +328,7 @@ export function createProgressiveSpectrumVisualizer(
     pendingChunkReadIndex = 0;
     if (touched) {
       markDirty();
-      requestRedraw({ dirtyMask: DIRTY.MAIN_BASE, force: false });
+      requestRedraw({ dirtyMask: DIRTY.MAIN_BASE });
     }
   }
 
@@ -357,7 +360,7 @@ export function createProgressiveSpectrumVisualizer(
     }
     state.predictionRevision += 1;
     state.renderedFrames = Math.max(state.renderedFrames, start + maxCopy);
-    requestRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY, force: false });
+    requestRedraw({ dirtyMask: DIRTY.MAIN_OVERLAY });
   }
 
   function reset(next: {

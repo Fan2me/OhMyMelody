@@ -7,6 +7,7 @@ import {
   type HeatmapTimeline,
 } from "./heatmap-render-core.js";
 import { getModuleLogger } from "@ohm/core/logging/logger.js";
+import { RafScheduler } from "@ohm/core/scheduler/scheduler.js";
 import {
   DEFAULT_MAIN_FPS,
   DEFAULT_OVERVIEW_FPS,
@@ -51,7 +52,7 @@ export interface SpectrumRenderController {
   attachAudioElement(nextAudioElement: HTMLAudioElement | null): void;
   setTimeline(nextTimeline: HeatmapTimeline | null): void;
   toggleMainFullscreen(next?: boolean): Promise<void>;
-  requestSpectrumRedraw(next?: boolean | { force?: boolean; includeOverviewBase?: boolean; dirtyMask?: number }): void;
+  requestSpectrumRedraw(next?: { includeOverviewBase?: boolean; dirtyMask?: number }): void;
   requestOverviewOverlayRedraw(): void;
   runHeatmapBenchmark(rounds?: number): HeatmapBenchmarkEntry[];
   markAutoPanSuppressed(nowTs?: number, durationMs?: number): void;
@@ -60,6 +61,32 @@ export interface SpectrumRenderController {
   getOverviewCanvas(): HTMLCanvasElement | null;
   getMainOverlayCanvas(): HTMLCanvasElement | null;
   getOverviewOverlayCanvas(): HTMLCanvasElement | null;
+  getRenderStats(): SpectrumRenderStats;
+}
+
+export interface SpectrumRenderTaskStats {
+  targetFps: number;
+  actualFps: number;
+  runCount: number;
+  nextRunInMs: number;
+}
+
+export interface SpectrumRenderCanvasStats extends SpectrumRenderTaskStats {
+  canvasWidth: number;
+  canvasHeight: number;
+  dpr: number;
+}
+
+export interface SpectrumRenderStats {
+  mainBase: SpectrumRenderCanvasStats;
+  mainOverlay: SpectrumRenderTaskStats;
+  overviewBase: SpectrumRenderCanvasStats;
+  overviewOverlay: SpectrumRenderTaskStats;
+  dirty: {
+    currentMask: number;
+    playing: boolean;
+    schedulerRunning: boolean;
+  };
 }
 
 function drawHeatmap(
@@ -148,9 +175,18 @@ export function createSpectrumRenderController(
   let resizeObserver: ResizeObserver | null = null;
   let audioCleanup: (() => void) | null = null;
   let audioElement: HTMLAudioElement | null = null;
-  let rafId: number | null = null;
+  const rafScheduler = new RafScheduler();
+  let schedulerStarted = false;
+  let schedulerTasksReady = false;
+  let frameTaskId: string | null = null;
+  let mainBaseTaskId: string | null = null;
+  let mainOverlayTaskId: string | null = null;
+  let overviewBaseTaskId: string | null = null;
+  let overviewOverlayTaskId: string | null = null;
+  let finalizeTaskId: string | null = null;
+  let taskRateSignature = "";
   let dirtyMask = 0;
-  let forceRender = false;
+  
   let playing = false;
   let lastAutoPanAt = 0;
   let autoPanSuppressedUntil = 0;
@@ -159,6 +195,10 @@ export function createSpectrumRenderController(
   let controlsVisible = false;
   let lastAutoPanLogKey = "";
   let lastHeatmapRenderLogKey = "";
+  const recentMainBaseDrawTimes: number[] = [];
+  const recentMainOverlayDrawTimes: number[] = [];
+  const recentOverviewBaseDrawTimes: number[] = [];
+  const recentOverviewOverlayDrawTimes: number[] = [];
   const layoutMetrics = {
     rootHeight: 0,
     mainWidth: 0,
@@ -169,16 +209,11 @@ export function createSpectrumRenderController(
   let splitDragRootTop = 0;
   let splitDragRootHeight = 0;
   let lastLayoutSignature = "";
-  const lastDrawAt = {
-    mainBase: 0,
-    mainOverlay: 0,
-    overviewBase: 0,
-    overviewOverlay: 0,
-  };
 
   const AUTO_PAN_MIN_INTERVAL_MS = 33;
   const AUTO_PAN_EDGE_RATIO = 1 / 10;
   const AUTO_PAN_SUPPRESS_MS = 250;
+  const SCHEDULER_FRAME_FPS = 60;
   const cleanups: Array<() => void> = [];
 
   function refreshLayoutMetricsFromElements(): void {
@@ -341,7 +376,7 @@ export function createSpectrumRenderController(
     }
     interactionState.spectrumMainFullscreen = isFullscreen;
     applySectionLayout();
-    schedule(DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY, true);
+    schedule(DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY);
   }
 
   async function setMainFullscreen(nextFullscreen: boolean): Promise<void> {
@@ -385,7 +420,7 @@ export function createSpectrumRenderController(
     interactionState.spectrumOverviewRatio = nextRatio;
     persistOverviewRatio(nextRatio);
     applySectionLayout();
-    schedule(undefined, true);
+    schedule();
   }
 
   function syncSectionVisibility(): void {
@@ -578,11 +613,396 @@ export function createSpectrumRenderController(
       sampleStrideFrames,
       "u32-region",
     );
-    if (target === "main") {
-      lastDrawAt.mainBase = now;
-    } else {
-      lastDrawAt.overviewBase = now;
+  }
+
+  function recordDraw(recentDrawTimes: number[], now: number): void {
+    recentDrawTimes.push(now);
+    const cutoff = now - 1000;
+    while (recentDrawTimes.length && (recentDrawTimes[0] ?? 0) < cutoff) {
+      recentDrawTimes.shift();
     }
+  }
+
+  function clearDirtyBits(mask: number): void {
+    dirtyMask &= ~mask;
+  }
+
+  function resolveTaskFps(rawFps: number | null | undefined, fallbackFps: number): number {
+    const fallback = Math.max(1, Math.floor(Number(fallbackFps) || SCHEDULER_FRAME_FPS));
+    const resolved = Number(rawFps);
+    if (!Number.isFinite(resolved) || resolved <= 0) {
+      return fallback;
+    }
+    return Math.max(1, Math.floor(resolved));
+  }
+
+  function getScheduledTaskRates() {
+    const state = getState();
+    const mainFps = resolveTaskFps(state.sections.main.fps, DEFAULT_MAIN_FPS);
+    const mainOverlayFps = resolveTaskFps(
+      state.sections.main.overlayFps,
+      state.sections.main.fps || mainFps,
+    );
+    const overviewFps = resolveTaskFps(state.sections.overview.fps, DEFAULT_OVERVIEW_FPS);
+    const overviewOverlayFps = resolveTaskFps(
+      state.sections.overview.overlayFps,
+      state.sections.overview.fps || overviewFps,
+    );
+    return {
+      frameFps: SCHEDULER_FRAME_FPS,
+      mainFps,
+      mainOverlayFps,
+      overviewFps,
+      overviewOverlayFps,
+    };
+  }
+
+  function getTaskSnapshot(
+    id: string | null,
+    recentDrawTimes: number[],
+  ): SpectrumRenderTaskStats | null {
+    if (!id) {
+      return null;
+    }
+    const snapshot = rafScheduler.getTaskSnapshot(id);
+    if (!snapshot) {
+      return null;
+    }
+    return {
+      targetFps: snapshot.targetFps ?? 0,
+      actualFps: recentDrawTimes.length,
+      runCount: snapshot.runCount,
+      nextRunInMs: Math.max(0, (snapshot.nextRunTs || 0) - performance.now()),
+    };
+  }
+
+  function ensureScheduledTasks(): void {
+    if (schedulerTasksReady) {
+      return;
+    }
+    const rates = getScheduledTaskRates();
+    frameTaskId = rafScheduler.addTask(() => {
+      runFrameTick();
+    }, {
+      priority: 0,
+      targetFps: rates.frameFps,
+    });
+    mainOverlayTaskId = rafScheduler.addTask(() => {
+      runMainOverlayTask();
+    }, {
+      priority: 5,
+      targetFps: rates.mainOverlayFps,
+    });
+    overviewOverlayTaskId = rafScheduler.addTask(() => {
+      runOverviewOverlayTask();
+    }, {
+      priority: 6,
+      targetFps: rates.overviewOverlayFps,
+    });
+    mainBaseTaskId = rafScheduler.addTask(() => {
+      runMainBaseTask();
+    }, {
+      priority: 10,
+      targetFps: rates.mainFps,
+    });
+    overviewBaseTaskId = rafScheduler.addTask(() => {
+      runOverviewBaseTask();
+    }, {
+      priority: 11,
+      targetFps: rates.overviewFps,
+    });
+    finalizeTaskId = rafScheduler.addTask(() => {
+      finishScheduledFrame();
+    }, {
+      priority: 100,
+      targetFps: rates.frameFps,
+    });
+    schedulerTasksReady = true;
+    taskRateSignature = "";
+  }
+
+  function syncScheduledTaskRates(forceWake = false): void {
+    ensureScheduledTasks();
+    const rates = getScheduledTaskRates();
+    const signature = [
+      rates.frameFps,
+      rates.mainFps,
+      rates.mainOverlayFps,
+      rates.overviewFps,
+      rates.overviewOverlayFps,
+    ].join("|");
+    if (!forceWake && signature === taskRateSignature) {
+      return;
+    }
+    taskRateSignature = signature;
+    if (frameTaskId) {
+      rafScheduler.updateTask(frameTaskId, {
+        priority: 0,
+        targetFps: rates.frameFps,
+      });
+    }
+    if (mainOverlayTaskId) {
+      rafScheduler.updateTask(mainOverlayTaskId, {
+        priority: 5,
+        targetFps: rates.mainOverlayFps,
+      });
+    }
+    if (overviewOverlayTaskId) {
+      rafScheduler.updateTask(overviewOverlayTaskId, {
+        priority: 6,
+        targetFps: rates.overviewOverlayFps,
+      });
+    }
+    if (mainBaseTaskId) {
+      rafScheduler.updateTask(mainBaseTaskId, {
+        priority: 10,
+        targetFps: rates.mainFps,
+      });
+    }
+    if (overviewBaseTaskId) {
+      rafScheduler.updateTask(overviewBaseTaskId, {
+        priority: 11,
+        targetFps: rates.overviewFps,
+      });
+    }
+    if (finalizeTaskId) {
+      rafScheduler.updateTask(finalizeTaskId, {
+        priority: 100,
+        targetFps: rates.frameFps,
+      });
+    }
+  }
+
+  function wakeScheduledTasks(mask: number): void {
+    ensureScheduledTasks();
+    const rates = getScheduledTaskRates();
+    const wakeAll = mask === 0;
+    if (wakeAll || (mask & DIRTY.MAIN_OVERLAY) !== 0) {
+      if (mainOverlayTaskId) {
+        rafScheduler.updateTask(mainOverlayTaskId, {
+          priority: 5,
+          targetFps: rates.mainOverlayFps,
+        });
+      }
+    }
+    if (wakeAll || (mask & DIRTY.OVERVIEW_OVERLAY) !== 0) {
+      if (overviewOverlayTaskId) {
+        rafScheduler.updateTask(overviewOverlayTaskId, {
+          priority: 6,
+          targetFps: rates.overviewOverlayFps,
+        });
+      }
+    }
+    if (wakeAll || (mask & DIRTY.MAIN_BASE) !== 0) {
+      if (mainBaseTaskId) {
+        rafScheduler.updateTask(mainBaseTaskId, {
+          priority: 10,
+          targetFps: rates.mainFps,
+        });
+      }
+    }
+    if (wakeAll || (mask & DIRTY.OVERVIEW_BASE) !== 0) {
+      if (overviewBaseTaskId) {
+        rafScheduler.updateTask(overviewBaseTaskId, {
+          priority: 11,
+          targetFps: rates.overviewFps,
+        });
+      }
+    }
+    if (wakeAll && frameTaskId) {
+      rafScheduler.updateTask(frameTaskId, {
+        priority: 0,
+        targetFps: rates.frameFps,
+      });
+    }
+    if (wakeAll && finalizeTaskId) {
+      rafScheduler.updateTask(finalizeTaskId, {
+        priority: 100,
+        targetFps: rates.frameFps,
+      });
+    }
+  }
+
+  function startScheduler(): void {
+    ensureScheduledTasks();
+    if (schedulerStarted) {
+      return;
+    }
+    syncScheduledTaskRates(true);
+    schedulerStarted = true;
+    rafScheduler.start();
+  }
+
+  function stopScheduler(): void {
+    if (!schedulerStarted) {
+      return;
+    }
+    rafScheduler.stop();
+    schedulerStarted = false;
+  }
+
+  function runFrameTick(): void {
+    syncSectionVisibility();
+    const state = getState();
+    if (!state.audio) {
+      dirtyMask = 0;
+      stopScheduler();
+      return;
+    }
+    if (playing) {
+      dirtyMask |= DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY;
+    }
+    maybeAutoPanToPlaybackHead();
+    syncCanvasSizes();
+  }
+
+  function runMainOverlayTask(): void {
+    const state = getState();
+    if (!state.audio || !state.sections.main.enabled || !state.sections.main.overlay) {
+      clearDirtyBits(DIRTY.MAIN_OVERLAY);
+      return;
+    }
+    if (!mainOverlay || !mainOverlayCtx) {
+      clearDirtyBits(DIRTY.MAIN_OVERLAY);
+      return;
+    }
+    const shouldDraw = playing || (dirtyMask & DIRTY.MAIN_OVERLAY) !== 0;
+    if (!shouldDraw) {
+      return;
+    }
+    mainOverlayRenderer.drawOverlay();
+    recordDraw(recentMainOverlayDrawTimes, performance.now());
+    dirtyMask &= ~DIRTY.MAIN_OVERLAY;
+  }
+
+  function runOverviewOverlayTask(): void {
+    const state = getState();
+    if (!state.audio || !state.sections.overview.enabled || !state.sections.overview.overlay) {
+      clearDirtyBits(DIRTY.OVERVIEW_OVERLAY);
+      return;
+    }
+    if (!overviewOverlay || !overviewOverlayCtx) {
+      clearDirtyBits(DIRTY.OVERVIEW_OVERLAY);
+      return;
+    }
+    const shouldDraw = playing || (dirtyMask & DIRTY.OVERVIEW_OVERLAY) !== 0;
+    if (!shouldDraw) {
+      return;
+    }
+    overviewOverlayRenderer.drawOverviewOverlay();
+    recordDraw(recentOverviewOverlayDrawTimes, performance.now());
+    dirtyMask &= ~DIRTY.OVERVIEW_OVERLAY;
+  }
+
+  function runMainBaseTask(): void {
+    const state = getState();
+    if (!state.audio || !state.sections.main.enabled) {
+      clearDirtyBits(DIRTY.MAIN_BASE);
+      return;
+    }
+    if (!mainBase || !mainBaseCtx) {
+      clearDirtyBits(DIRTY.MAIN_BASE);
+      return;
+    }
+    const shouldDraw = (dirtyMask & DIRTY.MAIN_BASE) !== 0;
+    if (!shouldDraw) {
+      return;
+    }
+    const frequencyViewport = resolveSpectrumFrequencyViewport(state);
+    const interactionState = getInteractionState();
+    const mainViewW = getMainViewFrameCount(interactionState);
+    const mainSampleStrideFrames = Math.max(
+      1,
+      getDisplayStrideFramesForZoom({
+        zoom: interactionState.spectrumZoom,
+        minZoom: 1,
+        maxZoom: 20,
+        minUnitsPerSecond: state.displaySampling.minUnitsPerSecond,
+        maxUnitsPerSecond: state.displaySampling.maxUnitsPerSecond,
+        frameRateHz: Math.max(1, Math.round(1 / FRAME_SEC)),
+      }),
+    );
+    const mainViewport = {
+      startSlot: Math.max(0, Math.floor(interactionState.spectrumOffset)),
+      endSlot: Math.max(
+        1,
+        Math.min(
+          interactionState.spectrumW || timeline?.totalFrames || 0,
+          Math.floor(interactionState.spectrumOffset + mainViewW),
+        ),
+      ),
+    };
+    renderBaseHeatmapTarget({
+      target: "main",
+      now: performance.now(),
+      state,
+      canvas: mainBase,
+      ctx: mainBaseCtx,
+      viewport: mainViewport,
+      representativeMode: state.displaySampling?.representativeMode || "first-valid",
+      frequencyViewport,
+      sampleStrideFrames: mainSampleStrideFrames,
+    });
+    recordDraw(recentMainBaseDrawTimes, performance.now());
+    dirtyMask &= ~DIRTY.MAIN_BASE;
+  }
+
+  function runOverviewBaseTask(): void {
+    const state = getState();
+    if (!state.audio || !state.sections.overview.enabled) {
+      clearDirtyBits(DIRTY.OVERVIEW_BASE);
+      return;
+    }
+    if (!overviewBase || !overviewBaseCtx) {
+      clearDirtyBits(DIRTY.OVERVIEW_BASE);
+      return;
+    }
+    const shouldDraw = (dirtyMask & DIRTY.OVERVIEW_BASE) !== 0;
+    if (!shouldDraw) {
+      return;
+    }
+    const frequencyViewport = resolveSpectrumFrequencyViewport(state);
+    const interactionState = getInteractionState();
+    const overviewTotalFrames = Math.max(
+      1,
+      Math.floor(interactionState.spectrumW || timeline?.totalFrames || 0),
+    );
+    const overviewSampleStrideFrames = Math.max(
+      1,
+      getDisplayStrideFramesForZoom({
+        zoom: 1,
+        minZoom: 1,
+        maxZoom: 20,
+        minUnitsPerSecond: 1,
+        maxUnitsPerSecond: state.displaySampling.maxUnitsPerSecond,
+        frameRateHz: Math.max(1, Math.round(1 / FRAME_SEC)),
+      }),
+    );
+
+    renderBaseHeatmapTarget({
+      target: "overview",
+      now: performance.now(),
+      state,
+      canvas: overviewBase,
+      ctx: overviewBaseCtx,
+      viewport: {
+        startSlot: 0,
+        endSlot: overviewTotalFrames,
+      },
+      representativeMode: state.displaySampling?.representativeMode || "first-valid",
+      frequencyViewport,
+      sampleStrideFrames: overviewSampleStrideFrames,
+    });
+    recordDraw(recentOverviewBaseDrawTimes, performance.now());
+    dirtyMask &= ~DIRTY.OVERVIEW_BASE;
+  }
+
+  function finishScheduledFrame(): void {
+    if (!dirtyMask && !playing) {
+      stopScheduler();
+      return;
+    }
+    // nothing to reset for removed `force` semantics
   }
 
   function schedule(
@@ -590,24 +1010,15 @@ export function createSpectrumRenderController(
       DIRTY.MAIN_OVERLAY |
       DIRTY.OVERVIEW_BASE |
       DIRTY.OVERVIEW_OVERLAY,
-    force = false,
   ): void {
     dirtyMask |= mask;
-    forceRender = forceRender || force;
-    if (!windowRef) {
-      renderFrame(performance.now());
-      return;
-    }
-    if (rafId === null) {
-      rafId = windowRef.requestAnimationFrame(renderFrame);
-    }
+    startScheduler();
+    syncScheduledTaskRates();
+    wakeScheduledTasks(mask);
   }
 
   function stopLoop(): void {
-    if (rafId !== null && windowRef) {
-      windowRef.cancelAnimationFrame(rafId);
-    }
-    rafId = null;
+    stopScheduler();
   }
 
   function resizeCanvas(
@@ -628,7 +1039,7 @@ export function createSpectrumRenderController(
 
   function syncCanvasSizes(): void {
     if (mainSection && mainBase && mainOverlay) {
-      resizeCanvas(mainBase, layoutMetrics.mainWidth, layoutMetrics.mainHeight, 1);
+      resizeCanvas(mainBase, layoutMetrics.mainWidth, layoutMetrics.mainHeight);
       resizeCanvas(mainOverlay, layoutMetrics.mainWidth, layoutMetrics.mainHeight);
     }
     if (overviewSection && overviewBase && overviewOverlay) {
@@ -636,158 +1047,12 @@ export function createSpectrumRenderController(
         overviewBase,
         layoutMetrics.overviewWidth,
         layoutMetrics.overviewHeight,
-        1,
       );
       resizeCanvas(
         overviewOverlay,
         layoutMetrics.overviewWidth,
         layoutMetrics.overviewHeight,
       );
-    }
-  }
-
-  function renderFrame(now: number): void {
-    rafId = null;
-    syncSectionVisibility();
-    const state = getState();
-    if (!state.audio) {
-      forceRender = false;
-      dirtyMask = 0;
-      return;
-    }
-    const representativeMode = state.displaySampling?.representativeMode || "first-valid";
-    if (playing) {
-      dirtyMask |= DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY;
-    }
-    maybeAutoPanToPlaybackHead(now);
-    syncCanvasSizes();
-
-    const pending = dirtyMask;
-    dirtyMask = 0;
-
-    const mainFps = Number.isFinite(state.sections.main.fps)
-      ? Math.max(0, Math.floor(state.sections.main.fps))
-      : DEFAULT_MAIN_FPS;
-    const mainOverlayFps = Number.isFinite(state.sections.main.overlayFps)
-      ? Math.max(0, Math.floor(state.sections.main.overlayFps))
-      : mainFps;
-    const overviewFps = Number.isFinite(state.sections.overview.fps)
-      ? Math.max(0, Math.floor(state.sections.overview.fps))
-      : DEFAULT_OVERVIEW_FPS;
-    const overviewOverlayFps = Number.isFinite(state.sections.overview.overlayFps)
-      ? Math.max(0, Math.floor(state.sections.overview.overlayFps))
-      : overviewFps;
-
-    if (
-      pending & DIRTY.MAIN_OVERLAY &&
-      state.sections.main.enabled &&
-      state.sections.main.overlay &&
-      mainOverlay &&
-      mainOverlayCtx
-    ) {
-      if (forceRender || mainOverlayFps <= 0 || now - lastDrawAt.mainOverlay >= 1000 / mainOverlayFps) {
-        mainOverlayRenderer.drawOverlay();
-        lastDrawAt.mainOverlay = now;
-      } else {
-        dirtyMask |= DIRTY.MAIN_OVERLAY;
-      }
-    }
-    if (
-      pending & DIRTY.OVERVIEW_OVERLAY &&
-      state.sections.overview.enabled &&
-      state.sections.overview.overlay &&
-      overviewOverlay &&
-      overviewOverlayCtx
-    ) {
-      if (forceRender || overviewOverlayFps <= 0 || now - lastDrawAt.overviewOverlay >= 1000 / overviewOverlayFps) {
-        overviewOverlayRenderer.drawOverviewOverlay();
-        lastDrawAt.overviewOverlay = now;
-      } else {
-        dirtyMask |= DIRTY.OVERVIEW_OVERLAY;
-      }
-    }
-    if (
-      pending & DIRTY.MAIN_BASE &&
-      state.sections.main.enabled &&
-      mainBase &&
-      mainBaseCtx
-    ) {
-      if (forceRender || mainFps <= 0 || now - lastDrawAt.mainBase >= 1000 / mainFps) {
-        const frequencyViewport = resolveSpectrumFrequencyViewport(state);
-        const interactionState = getInteractionState();
-        const mainViewW = getMainViewFrameCount(interactionState);
-        const mainSampleStrideFrames = Math.max(
-          1,
-          getDisplayStrideFramesForZoom({
-            zoom: interactionState.spectrumZoom,
-            minZoom: 1,
-            maxZoom: 20,
-            minUnitsPerSecond: state.displaySampling.minUnitsPerSecond,
-            maxUnitsPerSecond: state.displaySampling.maxUnitsPerSecond,
-            frameRateHz: Math.max(1, Math.round(1 / FRAME_SEC)),
-          }),
-        );
-        const mainViewport = {
-          startSlot: Math.max(0, Math.floor(interactionState.spectrumOffset)),
-          endSlot: Math.max(
-            1,
-            Math.min(
-              interactionState.spectrumW || timeline?.totalFrames || 0,
-              Math.floor(interactionState.spectrumOffset + mainViewW),
-            ),
-          ),
-        };
-        renderBaseHeatmapTarget({
-          target: "main",
-          now,
-          state,
-          canvas: mainBase,
-          ctx: mainBaseCtx,
-          viewport: mainViewport,
-          representativeMode,
-          frequencyViewport,
-          sampleStrideFrames: mainSampleStrideFrames,
-        });
-      } else {
-        dirtyMask |= DIRTY.MAIN_BASE;
-      }
-    }
-    if (
-      pending & DIRTY.OVERVIEW_BASE &&
-      state.sections.overview.enabled &&
-      overviewBase &&
-      overviewBaseCtx
-    ) {
-      if (forceRender || overviewFps <= 0 || now - lastDrawAt.overviewBase >= 1000 / overviewFps) {
-        const frequencyViewport = resolveSpectrumFrequencyViewport(state);
-        const interactionState = getInteractionState();
-        const overviewTotalFrames = Math.max(
-          1,
-          Math.floor(interactionState.spectrumW || timeline?.totalFrames || 0),
-        );
-        const overviewViewport = {
-          startSlot: 0,
-          endSlot: overviewTotalFrames,
-        };
-        renderBaseHeatmapTarget({
-          target: "overview",
-          now,
-          state,
-          canvas: overviewBase,
-          ctx: overviewBaseCtx,
-          viewport: overviewViewport,
-          representativeMode,
-          frequencyViewport,
-          sampleStrideFrames: 1,
-        });
-      } else {
-        dirtyMask |= DIRTY.OVERVIEW_BASE;
-      }
-    }
-
-    forceRender = false;
-    if (dirtyMask || playing) {
-      schedule(0);
     }
   }
 
@@ -911,7 +1176,7 @@ export function createSpectrumRenderController(
       resizeObserver?.disconnect();
       resizeObserver = new ResizeObserver((entries) => {
         refreshLayoutMetricsFromObserver(entries);
-        schedule(undefined, true);
+        schedule();
       });
       resizeObserver.observe(nextRoot);
       resizeObserver.observe(main.section);
@@ -1079,7 +1344,7 @@ export function createSpectrumRenderController(
       main.section.removeEventListener("pointerleave", handleMainPointerLeave);
     });
     syncSectionVisibility();
-    schedule(undefined, true);
+    schedule();
     return nextRoot;
   }
 
@@ -1091,14 +1356,14 @@ export function createSpectrumRenderController(
     audioElement = nextAudioElement;
     if (!audioElement || typeof audioElement.addEventListener !== "function") {
       playing = false;
-      schedule(undefined, true);
+      schedule();
       return;
     }
     const currentAudioElement = audioElement;
 
     const refresh = () => {
       playing = !currentAudioElement.paused && !currentAudioElement.ended;
-      schedule(DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY, true);
+      schedule(DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY);
     };
     const onTime = () => schedule(DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY);
     const pairs: Array<[string, EventListener]> = [
@@ -1134,18 +1399,17 @@ export function createSpectrumRenderController(
         nextRoot.parentElement.removeChild(nextRoot);
       }
     }
-    schedule(undefined, true);
+    schedule();
   }
 
   function setTimeline(nextTimeline: HeatmapTimeline | null): void {
     timeline = nextTimeline;
-    schedule(DIRTY.MAIN_BASE | DIRTY.OVERVIEW_BASE, true);
+    schedule(DIRTY.MAIN_BASE | DIRTY.OVERVIEW_BASE);
   }
 
   function requestSpectrumRedraw(
-    next?: boolean | { force?: boolean; includeOverviewBase?: boolean; dirtyMask?: number },
+    next?: { includeOverviewBase?: boolean; dirtyMask?: number },
   ): void {
-    const force = typeof next === "boolean" ? next : !!next?.force;
     const dirtyMask =
       typeof next === "object" && next && Number.isFinite(next.dirtyMask)
         ? Math.max(0, Math.floor(Number(next.dirtyMask)))
@@ -1153,9 +1417,7 @@ export function createSpectrumRenderController(
     const includeOverviewBase =
       dirtyMask !== null
         ? (dirtyMask & DIRTY.OVERVIEW_BASE) !== 0
-        : typeof next === "boolean"
-          ? true
-          : next?.includeOverviewBase !== false;
+        : next?.includeOverviewBase !== false;
     const resolvedMask =
       dirtyMask !== null
         ? dirtyMask
@@ -1163,14 +1425,11 @@ export function createSpectrumRenderController(
           DIRTY.MAIN_OVERLAY |
           (includeOverviewBase ? DIRTY.OVERVIEW_BASE : 0) |
           DIRTY.OVERVIEW_OVERLAY;
-    schedule(
-      resolvedMask,
-      force,
-    );
+    schedule(resolvedMask);
   }
 
   function requestOverviewOverlayRedraw(): void {
-    schedule(DIRTY.OVERVIEW_OVERLAY, false);
+    schedule(DIRTY.OVERVIEW_OVERLAY);
   }
 
   function runHeatmapBenchmark(rounds = 3): HeatmapBenchmarkEntry[] {
@@ -1243,6 +1502,17 @@ export function createSpectrumRenderController(
     }
     stopLoop();
     destroyHeatmapWorker();
+    frameTaskId = null;
+    mainBaseTaskId = null;
+    mainOverlayTaskId = null;
+    overviewBaseTaskId = null;
+    overviewOverlayTaskId = null;
+    finalizeTaskId = null;
+    schedulerTasksReady = false;
+    schedulerStarted = false;
+    taskRateSignature = "";
+    dirtyMask = 0;
+    
     if (root?.parentElement) {
       root.parentElement.removeChild(root);
     }
@@ -1281,6 +1551,56 @@ export function createSpectrumRenderController(
     return overviewOverlay;
   }
 
+  function buildCanvasStats(
+    canvas: HTMLCanvasElement | null,
+    taskId: string | null,
+  ): SpectrumRenderCanvasStats {
+    const task = getTaskSnapshot(
+      taskId,
+      canvas === mainBase
+        ? recentMainBaseDrawTimes
+        : canvas === overviewBase
+          ? recentOverviewBaseDrawTimes
+          : [],
+    );
+    const cssWidth = Math.max(1, canvas?.clientWidth || Math.floor((canvas?.width || 1) / Math.max(1, windowRef?.devicePixelRatio || 1)) || 1);
+    const cssHeight = Math.max(1, canvas?.clientHeight || Math.floor((canvas?.height || 1) / Math.max(1, windowRef?.devicePixelRatio || 1)) || 1);
+    const dpr = canvas ? Math.max(1, canvas.width / cssWidth, canvas.height / cssHeight) : Math.max(1, windowRef?.devicePixelRatio || 1);
+    return {
+      targetFps: task?.targetFps || 0,
+      actualFps: task?.actualFps || 0,
+      runCount: task?.runCount || 0,
+      nextRunInMs: task?.nextRunInMs || 0,
+      canvasWidth: canvas?.width || 0,
+      canvasHeight: canvas?.height || 0,
+      dpr,
+    };
+  }
+
+  function getRenderStats(): SpectrumRenderStats {
+    return {
+      mainBase: buildCanvasStats(mainBase, mainBaseTaskId),
+      mainOverlay: getTaskSnapshot(mainOverlayTaskId, recentMainOverlayDrawTimes) || {
+        targetFps: 0,
+        actualFps: 0,
+        runCount: 0,
+        nextRunInMs: 0,
+      },
+      overviewBase: buildCanvasStats(overviewBase, overviewBaseTaskId),
+      overviewOverlay: getTaskSnapshot(overviewOverlayTaskId, recentOverviewOverlayDrawTimes) || {
+        targetFps: 0,
+        actualFps: 0,
+        runCount: 0,
+        nextRunInMs: 0,
+      },
+      dirty: {
+        currentMask: dirtyMask,
+        playing,
+        schedulerRunning: schedulerStarted,
+      },
+    };
+  }
+
   return {
     mount,
     attachAudioElement,
@@ -1295,5 +1615,6 @@ export function createSpectrumRenderController(
     getOverviewCanvas,
     getMainOverlayCanvas,
     getOverviewOverlayCanvas,
+    getRenderStats,
   };
 }

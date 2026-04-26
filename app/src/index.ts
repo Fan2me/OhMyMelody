@@ -225,6 +225,7 @@ function formatDebugStateBlock(): string {
   const displayRows = Math.max(1, debugState.spectral.displayMaxBin - debugState.spectral.displayMinBin + 1);
   const viewCols = Math.max(1, Math.floor(debugState.viewport.viewFrames));
   const totalCols = Math.max(1, Math.floor(debugState.viewport.totalFrames));
+  const render = debugState.render;
   const deltaX =
     Number.isFinite(Number(debugState.hover.canvasX)) && Number.isFinite(Number(debugState.hover.frameX))
       ? Number(debugState.hover.canvasX) - Number(debugState.hover.frameX)
@@ -246,15 +247,32 @@ function formatDebugStateBlock(): string {
   );
   const spectrumUps = Math.max(1, Math.round(100 / spectrumStride));
   const sampledColsByUps = Math.max(1, Math.ceil(viewCols / spectrumStride));
+  const formatTaskFps = (stats: { actualFps: number; targetFps: number }) =>
+    `${formatDebugNumber(stats.actualFps, 1)}/${formatDebugNumber(stats.targetFps, 0)}fps`;
+  const dirty = debugState.render.dirty;
+  const format01 = (value: number) => (value ? "1" : "0");
 
   return [
-    `refresh: main=${uiState.sections.main.fps} mainOverlay=${uiState.sections.main.overlayFps} overview=${uiState.sections.overview.fps} overviewOverlay=${uiState.sections.overview.overlayFps}`,
-    `sampling: mode=${uiState.displaySampling.representativeMode} minUPS=${uiState.displaySampling.minUnitsPerSecond} maxUPS=${uiState.displaySampling.maxUnitsPerSecond}`,
-    `sampling-spectrum: stride=${spectrumStride} frames (~${spectrumUps} UPS @100Hz)`,
-    `viewport: total=${debugState.viewport.totalFrames} view=${debugState.viewport.viewFrames} offset=${formatDebugNumber(debugState.viewport.offsetFrames, 2)} zoom=${formatDebugNumber(debugState.viewport.zoom, 3)}`,
-    `draw-matrix: rows(pitchBins)=${displayRows} cols(sampledFrames)=${sampledColsByUps} sourceViewFrames=${viewCols} totalFrames=${totalCols}`,
-    `prediction: frameCount=${debugState.prediction.frameCount} inferenceTotal=${debugState.prediction.inferenceTotalCount}`,
-    `hover: frame=${debugState.hover.frame} bin=${formatDebugNumber(debugState.hover.frameBin, 2)} dx=${formatDebugNumber(deltaX, 2)} dy=${formatDebugNumber(deltaY, 2)}`,
+    `viewport`,
+    `  totalFrames=${debugState.viewport.totalFrames} viewFrames=${debugState.viewport.viewFrames} offset=${formatDebugNumber(debugState.viewport.offsetFrames, 2)} zoom=${formatDebugNumber(debugState.viewport.zoom, 3)}`,
+    `spectral`,
+    `  bins=${debugState.spectral.totalBins} display=${debugState.spectral.displayMinBin}-${debugState.spectral.displayMaxBin} xPerFrame=${formatDebugNumber(debugState.spectral.xPerFrame, 2)} yPerBin=${formatDebugNumber(debugState.spectral.yPerBin, 2)}`,
+    `render`,
+    `  mainBase      fps=${formatTaskFps(render.mainBase)} rows=${render.mainBase.rows} cols=${render.mainBase.cols} stride=${render.mainBase.sampleStrideFrames} px=${render.mainBase.canvasWidth}x${render.mainBase.canvasHeight} dpr=${formatDebugNumber(render.mainBase.dpr, 2)}`,
+    `  mainOverlay   fps=${formatTaskFps(render.mainOverlay)} target=${formatDebugNumber(render.mainOverlay.targetFps, 0)}`,
+    `  overviewBase  fps=${formatTaskFps(render.overviewBase)} rows=${render.overviewBase.rows} cols=${render.overviewBase.cols} stride=${render.overviewBase.sampleStrideFrames} px=${render.overviewBase.canvasWidth}x${render.overviewBase.canvasHeight} dpr=${formatDebugNumber(render.overviewBase.dpr, 2)}`,
+    `  overviewOverlay fps=${formatTaskFps(render.overviewOverlay)} target=${formatDebugNumber(render.overviewOverlay.targetFps, 0)}`,
+    `dirty`,
+    `  mask=${dirty.currentMask} force=${dirty.forceRender ? "yes" : "no"} playing=${dirty.playing ? "yes" : "no"} scheduler=${dirty.schedulerRunning ? "on" : "off"}`,
+    `  bits mainBase=${format01(dirty.mainBase)} mainOverlay=${format01(dirty.mainOverlay)} overviewBase=${format01(dirty.overviewBase)} overviewOverlay=${format01(dirty.overviewOverlay)}`,
+    `sampling`,
+    `  mode=${uiState.displaySampling.representativeMode} minUPS=${uiState.displaySampling.minUnitsPerSecond} maxUPS=${uiState.displaySampling.maxUnitsPerSecond} stride=${spectrumStride} (~${spectrumUps} UPS @100Hz)`,
+    `draw-space`,
+    `  pitchBins=${displayRows} sampledCols=${sampledColsByUps} sourceViewFrames=${viewCols} totalFrames=${totalCols}`,
+    `prediction`,
+    `  frameCount=${debugState.prediction.frameCount} confidence=${debugState.prediction.confidenceCount} inferenceTotal=${debugState.prediction.inferenceTotalCount}`,
+    `hover`,
+    `  frame=${debugState.hover.frame} bin=${formatDebugNumber(debugState.hover.frameBin, 2)} dx=${formatDebugNumber(deltaX, 2)} dy=${formatDebugNumber(deltaY, 2)}`,
   ].join("\n");
 }
 
@@ -266,7 +284,48 @@ function renderDebugPanel(): void {
     debugInfo.textContent = "调试面板已关闭";
     return;
   }
-  debugInfo.textContent = formatDebugStateBlock();
+  const block = formatDebugStateBlock();
+  const items = buildDebugItemsFromBlock(block);
+  debugInfo.innerHTML = items
+    .map(
+      (it) =>
+        `<div class="debug-item"><div class="debug-title">${escapeHtml(it.title)}</div><div class="debug-content">${escapeHtml(
+          it.content,
+        )}</div></div>`,
+    )
+    .join("");
+}
+
+function escapeHtml(value: string): string {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildDebugItemsFromBlock(block: string): Array<{ title: string; content: string }> {
+  const lines = block.split(/\r?\n/);
+  const items: Array<{ title: string; content: string }> = [];
+  let curTitle: string | null = null;
+  let curContentLines: string[] = [];
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\s+$/g, "");
+    if (/^\S/.test(line)) {
+      if (curTitle !== null) {
+        items.push({ title: curTitle, content: curContentLines.join("\n").trim() });
+      }
+      curTitle = line.trim();
+      curContentLines = [];
+    } else {
+      curContentLines.push(line.replace(/^\s+/, ""));
+    }
+  }
+  if (curTitle !== null) {
+    items.push({ title: curTitle, content: curContentLines.join("\n").trim() });
+  }
+  return items;
 }
 
 function ensureDebugLoop(): void {
