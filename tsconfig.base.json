@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@ohm/core": [
+        "packages/core/src/index.ts"
+      ],
+      "@ohm/core/*": [
+        "packages/core/src/*"
+      ],
+      "@ohm/runtime": [
+        "packages/runtime/src/index.ts"
+      ],
+      "@ohm/runtime/*": [
+        "packages/runtime/src/*"
+      ],
+      "@ohm/ui": [
+        "packages/ui/src/index.ts"
+      ]
+    },
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "useDefineForClassFields": true,
+    "resolveJsonModule": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "ignoreDeprecations": "6.0"
+  }
+}

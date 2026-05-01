@@ -1,0 +1,34 @@
+{
+  "name": "@ohm/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js"
+    },
+    "./*": {
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b --pretty false && node ../../scripts/copy-core-runtime-assets.mjs",
+    "typecheck": "tsc -b --pretty false",
+    "test": "pnpm run build && node --test test/index.mjs",
+    "lint": "node ../../scripts/lint-package.mjs src",
+    "lint:fix": "node ../../scripts/lint-package.mjs src --fix",
+    "clean": "node ../../scripts/clean.mjs"
+  },
+  "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.1"
+  }
+}

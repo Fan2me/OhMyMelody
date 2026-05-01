@@ -1,0 +1,9 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": [
+    "**/.agent_versions/**",
+    "**/dist/**",
+    "**/.turbo/**",
+    "**/node_modules/**"
+  ]
+}

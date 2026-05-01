@@ -1,0 +1,24 @@
+{
+  "name": "@ohm/app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/app.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 0.0.0.0 --port 4173",
+    "preview": "vite preview",
+    "test": "pnpm --dir .. build && node --test test/browser-worker.mjs",
+    "typecheck": "tsc -b --pretty false",
+    "lint": "node ../scripts/lint-package.mjs src",
+    "lint:fix": "node ../scripts/lint-package.mjs src --fix",
+    "clean": "node ../scripts/clean.mjs"
+  },
+  "dependencies": {
+    "@ohm/core": "workspace:*",
+    "@ohm/runtime": "workspace:*",
+    "@ohm/ui": "workspace:*",
+    "i18next": "^26.0.8"
+  }
+}
