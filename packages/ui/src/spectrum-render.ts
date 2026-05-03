@@ -366,7 +366,7 @@ export function createSpectrumRenderController(
       mainSection.style.minHeight = isFullscreen ? "0px" : `${MIN_MAIN_SECTION_HEIGHT}px`;
       mainSection.style.border = isFullscreen ? "0" : "1px solid rgba(54, 80, 130, 0.08)";
       mainSection.style.borderRadius = isFullscreen ? "0" : "0";
-      mainSection.style.background = isFullscreen ? "transparent" : "rgba(245, 248, 255, 0.9)";
+      mainSection.style.background = isFullscreen ? "rgba(245, 248, 255, 0.96)" : "rgba(245, 248, 255, 0.9)";
       mainSection.style.boxShadow = isFullscreen ? "none" : "inset 0 1px 0 rgba(255, 255, 255, 0.72), 0 10px 24px rgba(19, 37, 70, 0.08)";
     }
   }
@@ -1035,33 +1035,49 @@ export function createSpectrumRenderController(
     width: number,
     height: number,
     maxDpr = Number.POSITIVE_INFINITY,
-  ): void {
+  ): boolean {
     const dpr = Math.max(
       1,
       Math.min(maxDpr, windowRef?.devicePixelRatio || 1),
     );
     const nextWidth = Math.max(1, Math.floor(Math.max(1, width) * dpr));
     const nextHeight = Math.max(1, Math.floor(Math.max(1, height) * dpr));
-    if (canvas.width !== nextWidth) canvas.width = nextWidth;
-    if (canvas.height !== nextHeight) canvas.height = nextHeight;
+    let resized = false;
+    if (canvas.width !== nextWidth) {
+      canvas.width = nextWidth;
+      resized = true;
+    }
+    if (canvas.height !== nextHeight) {
+      canvas.height = nextHeight;
+      resized = true;
+    }
+    return resized;
   }
 
   function syncCanvasSizes(): void {
+    let resized = false;
     if (mainSection && mainBase && mainOverlay) {
-      resizeCanvas(mainBase, layoutMetrics.mainWidth, layoutMetrics.mainHeight);
-      resizeCanvas(mainOverlay, layoutMetrics.mainWidth, layoutMetrics.mainHeight);
+      resized = resizeCanvas(mainBase, layoutMetrics.mainWidth, layoutMetrics.mainHeight) || resized;
+      resized = resizeCanvas(mainOverlay, layoutMetrics.mainWidth, layoutMetrics.mainHeight) || resized;
     }
     if (overviewSection && overviewBase && overviewOverlay) {
-      resizeCanvas(
+      resized = resizeCanvas(
         overviewBase,
         layoutMetrics.overviewWidth,
         layoutMetrics.overviewHeight,
-      );
-      resizeCanvas(
+      ) || resized;
+      resized = resizeCanvas(
         overviewOverlay,
         layoutMetrics.overviewWidth,
         layoutMetrics.overviewHeight,
-      );
+      ) || resized;
+    }
+    if (resized) {
+      dirtyMask |=
+        DIRTY.MAIN_BASE |
+        DIRTY.MAIN_OVERLAY |
+        DIRTY.OVERVIEW_BASE |
+        DIRTY.OVERVIEW_OVERLAY;
     }
   }
 
