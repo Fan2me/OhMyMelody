@@ -176,6 +176,7 @@ export function createSpectrumRenderController(
   let toolbar: HTMLDivElement | null = null;
   let mainFullscreenToggle: HTMLButtonElement | null = null;
   let resizeObserver: ResizeObserver | null = null;
+  let fullscreenRelayoutRafId: number | null = null;
   let audioCleanup: (() => void) | null = null;
   let audioElement: HTMLAudioElement | null = null;
   const rafScheduler = new RafScheduler();
@@ -364,11 +365,36 @@ export function createSpectrumRenderController(
         ? `${1 - ratio} ${1 - ratio} 0px`
         : "1 1 auto";
       mainSection.style.minHeight = isFullscreen ? "0px" : `${MIN_MAIN_SECTION_HEIGHT}px`;
+      mainSection.style.width = isFullscreen ? "100vw" : "";
+      mainSection.style.height = isFullscreen ? "100vh" : "";
+      mainSection.style.position = isFullscreen ? "fixed" : "";
+      mainSection.style.inset = isFullscreen ? "0" : "";
+      mainSection.style.zIndex = isFullscreen ? "3" : "";
       mainSection.style.border = isFullscreen ? "0" : "1px solid rgba(54, 80, 130, 0.08)";
       mainSection.style.borderRadius = isFullscreen ? "0" : "0";
       mainSection.style.background = isFullscreen ? "rgba(245, 248, 255, 0.96)" : "rgba(245, 248, 255, 0.9)";
       mainSection.style.boxShadow = isFullscreen ? "none" : "inset 0 1px 0 rgba(255, 255, 255, 0.72), 0 10px 24px rgba(19, 37, 70, 0.08)";
     }
+  }
+
+  function queueFullscreenRelayout(): void {
+    if (!windowRef) {
+      refreshLayoutMetricsFromElements();
+      applySectionLayout();
+      syncCanvasSizes();
+      schedule();
+      return;
+    }
+    if (fullscreenRelayoutRafId !== null) {
+      windowRef.cancelAnimationFrame(fullscreenRelayoutRafId);
+    }
+    fullscreenRelayoutRafId = windowRef.requestAnimationFrame(() => {
+      fullscreenRelayoutRafId = null;
+      refreshLayoutMetricsFromElements();
+      applySectionLayout();
+      syncCanvasSizes();
+      schedule();
+    });
   }
 
   function syncFullscreenStateFromDocument(): void {
@@ -378,8 +404,7 @@ export function createSpectrumRenderController(
       return;
     }
     interactionState.spectrumMainFullscreen = isFullscreen;
-    applySectionLayout();
-    schedule(DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY);
+    queueFullscreenRelayout();
   }
 
   async function setMainFullscreen(nextFullscreen: boolean): Promise<void> {
@@ -402,7 +427,7 @@ export function createSpectrumRenderController(
         `ui spectrum fullscreen unavailable: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    syncFullscreenStateFromDocument();
+    queueFullscreenRelayout();
   }
 
   function updateOverviewRatioFromPoint(clientY: number): void {
@@ -845,6 +870,7 @@ export function createSpectrumRenderController(
   }
 
   function runFrameTick(): void {
+    refreshLayoutMetricsFromElements();
     syncSectionVisibility();
     const state = getState();
     if (!state.audio) {
@@ -1226,6 +1252,37 @@ export function createSpectrumRenderController(
         fullscreenCleanup = null;
       });
     }
+    const windowResizeListeners: Array<[string, EventListener]> = [];
+    const handleViewportResize = () => {
+      queueFullscreenRelayout();
+    };
+    if (windowRef && typeof windowRef.addEventListener === "function") {
+      windowResizeListeners.push(["resize", handleViewportResize]);
+      windowResizeListeners.push(["orientationchange", handleViewportResize]);
+      for (const [type, listener] of windowResizeListeners) {
+        windowRef.addEventListener(type, listener);
+      }
+    }
+    const visualViewport = windowRef?.visualViewport ?? null;
+    if (visualViewport && typeof visualViewport.addEventListener === "function") {
+      visualViewport.addEventListener("resize", handleViewportResize);
+      visualViewport.addEventListener("scroll", handleViewportResize);
+      cleanups.push(() => {
+        visualViewport.removeEventListener("resize", handleViewportResize);
+        visualViewport.removeEventListener("scroll", handleViewportResize);
+      });
+    }
+    cleanups.push(() => {
+      if (windowRef && typeof windowRef.removeEventListener === "function") {
+        for (const [type, listener] of windowResizeListeners) {
+          windowRef.removeEventListener(type, listener);
+        }
+      }
+      if (fullscreenRelayoutRafId !== null && windowRef) {
+        windowRef.cancelAnimationFrame(fullscreenRelayoutRafId);
+        fullscreenRelayoutRafId = null;
+      }
+    });
     const splitDraggingState = {
       active: false,
       pointerId: -1,
@@ -1540,6 +1597,10 @@ export function createSpectrumRenderController(
     schedulerStarted = false;
     taskRateSignature = "";
     dirtyMask = 0;
+    if (fullscreenRelayoutRafId !== null && windowRef) {
+      windowRef.cancelAnimationFrame(fullscreenRelayoutRafId);
+      fullscreenRelayoutRafId = null;
+    }
     
     if (root?.parentElement) {
       root.parentElement.removeChild(root);
