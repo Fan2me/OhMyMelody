@@ -7,8 +7,8 @@ import {
 import type { AnalysisPlan, AnalysisPlanTask } from "./analysis.js";
 
 export const ANALYSIS_WARMUP_CHUNK_SEC = 1.28;
-export const ANALYSIS_WARMUP_ROUNDS = 20;
-export const ANALYSIS_STEADY_CHUNK_SEC = 1.28*20;
+export const ANALYSIS_WARMUP_ROUNDS = 3;
+export const ANALYSIS_STEADY_CHUNK_SEC = 1.28 * 4;
 export const ANALYSIS_STREAM_CHUNK_SEC = 1.28;
 
 export type SampleQueue = {

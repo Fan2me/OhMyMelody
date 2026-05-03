@@ -96,7 +96,10 @@ export function getDisplayUnitsPerSecondForZoom({
   if (hiUnits === loUnits) {
     return loUnits;
   }
-  return loUnits + (hiUnits - loUnits) * clampNumber(t, 0, 1);
+  return Math.max(
+    1,
+    Math.round(loUnits + (hiUnits - loUnits) * clampNumber(t, 0, 1)),
+  );
 }
 
 export function getDisplayMaxZoomForTotalFrames({

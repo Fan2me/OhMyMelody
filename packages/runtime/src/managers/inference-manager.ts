@@ -82,6 +82,7 @@ type SessionState = {
   modelName: string;
   id: number;
   useCachedResult: boolean;
+  complete: boolean;
   result: InferenceResult;
 };
 
@@ -142,6 +143,7 @@ export class InferenceManager {
     modelName: "",
     id: 0,
     useCachedResult: false,
+    complete: false,
     result: buildEmptyInferenceResult(),
   };
   private pending = new Map<string, PendingPromise>();
@@ -421,6 +423,7 @@ export class InferenceManager {
     this.sessionState.modelName = nextModelName;
     this.sessionState.id += 1;
     this.sessionState.useCachedResult = false;
+    this.sessionState.complete = false;
     this.sessionState.result = buildEmptyInferenceResult();
   }
 
@@ -439,6 +442,8 @@ export class InferenceManager {
       await this.startNewSession(safeModelName, "initial");
     } else if (this.sessionState.modelName !== safeModelName) {
       await this.startNewSession(safeModelName, "model-changed");
+    } else if (this.sessionState.complete) {
+      await this.startNewSession(safeModelName, "previous-complete");
     }
     return safeModelName;
   }
@@ -566,6 +571,7 @@ export class InferenceManager {
         this.sessionState.result,
         result,
       );
+      this.sessionState.complete = complete === true;
       const mergedResult = this.sessionState.result;
       await this.writeCachedResult(cacheKey, complete, mergedResult);
       inferenceLogger.info(

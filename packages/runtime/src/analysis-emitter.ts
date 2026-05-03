@@ -59,12 +59,6 @@ export function createPhaseEmitter({
     return context;
   }
 
-  function setPhase(phase: AnalysisPhase): AnalysisContext {
-    const context = requireContext();
-    context.phase = phase;
-    return context;
-  }
-
   function emitPhaseEnd<P extends AnalysisPhase>(
     phase: P,
     index: number,
@@ -97,7 +91,6 @@ export function createPhaseEmitter({
   }
 
   return {
-    setPhase,
     emitPhaseEnd,
   };
 }

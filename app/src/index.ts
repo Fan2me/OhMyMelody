@@ -195,7 +195,10 @@ function getSpectrumStrideForZoom({
   const t = hiZoom === loZoom ? 1 : (safeZoom - loZoom) / (hiZoom - loZoom);
   const loUps = Math.max(1, Number.isFinite(minUnitsPerSecond) ? minUnitsPerSecond : 5);
   const hiUps = Math.max(loUps, Number.isFinite(maxUnitsPerSecond) ? maxUnitsPerSecond : 100);
-  const unitsPerSecond = loUps + (hiUps - loUps) * clampNumber(t, 0, 1);
+  const unitsPerSecond = Math.max(
+    1,
+    Math.round(loUps + (hiUps - loUps) * clampNumber(t, 0, 1)),
+  );
   const safeFrameRate = Math.max(1, Number.isFinite(frameRateHz) ? frameRateHz : 100);
   return Math.max(1, Math.round(safeFrameRate / Math.max(1e-6, unitsPerSecond)));
 }

@@ -1,6 +1,3 @@
-import type { CFPBatch } from "@ohm/core/cache/cfp.js";
-import type { InferenceResult } from "./analysis.js";
-
 export type SourceDescriptor =
   | {
       kind: "file";
@@ -55,48 +52,4 @@ export enum AnalysisPhase {
   CFP = "cfp",
   INFERENCE = "inference",
   OUTPUT = "output",
-}
-
-export interface AnalyzerPhaseEvent {
-  type: "phase-end";
-  phase: AnalysisPhase;
-  index: number;
-  context: {
-    state: unknown;
-    phase: AnalysisPhase;
-  };
-  state: unknown;
-  data:
-    | {
-        audio: { pcm: Float32Array; fs: number; mode?: string };
-        reuseCFP?: boolean;
-      }
-    | {
-        cfp: readonly CFPBatch[];
-        allCfp: readonly CFPBatch[];
-      }
-    | {
-        cfp: readonly CFPBatch[];
-        allCfp: readonly CFPBatch[];
-        inference: InferenceResult | null;
-      }
-    | {
-        audio: { pcm: Float32Array; fs: number; mode?: string };
-        cfp: readonly CFPBatch[];
-        allCfp: readonly CFPBatch[];
-        inference: InferenceResult | null;
-      };
-}
-
-export type AnalyzerEventListener = (
-  event: AnalyzerPhaseEvent,
-) => void;
-
-export interface Analyzer {
-  subscribe(listener: AnalyzerEventListener): () => void;
-  setAudio(
-    input: AnalyzeInput,
-    execution?: AnalyzeExecutionOptions,
-  ): Promise<void>;
-  step(): Promise<void>;
 }
