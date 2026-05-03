@@ -48,6 +48,7 @@ const MIN_MAIN_SECTION_HEIGHT = 240;
 const MIN_OVERVIEW_SECTION_HEIGHT = 96;
 const SPLITTER_HIT_HEIGHT = 14;
 const OVERVIEW_RATIO_FALLBACK = DEFAULT_OVERVIEW_RATIO;
+const MOBILE_PSEUDO_FULLSCREEN_BREAKPOINT = 720;
 const spectrumRenderLogger = getModuleLogger("core.ui.spectrum.render");
 
 export interface SpectrumRenderController {
@@ -147,6 +148,50 @@ function preventDefaultIfPossible(event: unknown) {
   }
 }
 
+type FullscreenDocument = Document & {
+  webkitFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => Promise<void> | void;
+};
+
+type FullscreenHTMLElement = HTMLElement & {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+  webkitRequestFullScreen?: () => Promise<void> | void;
+};
+
+function getFullscreenElement(documentRef: Document | null): Element | null {
+  const fullscreenDocument = documentRef as FullscreenDocument | null;
+  return (
+    fullscreenDocument?.fullscreenElement ||
+    fullscreenDocument?.webkitFullscreenElement ||
+    null
+  );
+}
+
+function requestElementFullscreen(element: HTMLElement): Promise<void> {
+  const fullscreenElement = element as FullscreenHTMLElement;
+  const request =
+    fullscreenElement.requestFullscreen ||
+    fullscreenElement.webkitRequestFullscreen ||
+    fullscreenElement.webkitRequestFullScreen ||
+    null;
+  if (!request) {
+    return Promise.reject(new Error("requestFullscreen unavailable"));
+  }
+  return Promise.resolve(request.call(element));
+}
+
+function exitFullscreenDocument(documentRef: Document | null): Promise<void> {
+  const fullscreenDocument = documentRef as FullscreenDocument | null;
+  const exit =
+    fullscreenDocument?.exitFullscreen ||
+    fullscreenDocument?.webkitExitFullscreen ||
+    null;
+  if (!exit) {
+    return Promise.resolve();
+  }
+  return Promise.resolve(exit.call(fullscreenDocument));
+}
+
 export function createSpectrumRenderController(
   deps: SpectrumRenderControllerDeps,
 ): SpectrumRenderController {
@@ -159,6 +204,7 @@ export function createSpectrumRenderController(
     overviewOverlayRenderer,
   } = deps;
 
+  let mountElement: HTMLElement | null = null;
   let root: HTMLDivElement | null = null;
   let mainSection: HTMLElement | null = null;
   let overviewSection: HTMLElement | null = null;
@@ -176,6 +222,7 @@ export function createSpectrumRenderController(
   let toolbar: HTMLDivElement | null = null;
   let mainFullscreenToggle: HTMLButtonElement | null = null;
   let resizeObserver: ResizeObserver | null = null;
+  let fullscreenRelayoutRafId: number | null = null;
   let audioCleanup: (() => void) | null = null;
   let audioElement: HTMLAudioElement | null = null;
   const rafScheduler = new RafScheduler();
@@ -195,6 +242,7 @@ export function createSpectrumRenderController(
   let autoPanSuppressedUntil = 0;
   let timeline: HeatmapTimeline | null = null;
   let fullscreenCleanup: (() => void) | null = null;
+  let mobilePseudoFullscreen = false;
   let controlsVisible = false;
   let lastAutoPanLogKey = "";
   let lastHeatmapRenderLogKey = "";
@@ -218,6 +266,60 @@ export function createSpectrumRenderController(
   const AUTO_PAN_SUPPRESS_MS = 250;
   const SCHEDULER_FRAME_FPS = 60;
   const cleanups: Array<() => void> = [];
+
+  function getViewportSize(): { width: number; height: number } {
+    const visualViewport = windowRef?.visualViewport ?? null;
+    const documentElement = documentRef?.documentElement ?? null;
+    return {
+      width: Math.max(
+        1,
+        Math.floor(
+          Number(visualViewport?.width) ||
+            Number(windowRef?.innerWidth) ||
+            Number(documentElement?.clientWidth) ||
+            1,
+        ),
+      ),
+      height: Math.max(
+        1,
+        Math.floor(
+          Number(visualViewport?.height) ||
+            Number(windowRef?.innerHeight) ||
+            Number(documentElement?.clientHeight) ||
+            1,
+        ),
+      ),
+    };
+  }
+
+  function shouldUseMobilePseudoFullscreen(): boolean {
+    const viewport = getViewportSize();
+    const coarsePointer =
+      !!windowRef &&
+      typeof windowRef.matchMedia === "function" &&
+      windowRef.matchMedia("(hover: none) and (pointer: coarse)").matches;
+    return (
+      viewport.width <= MOBILE_PSEUDO_FULLSCREEN_BREAKPOINT ||
+      (coarsePointer && Math.min(viewport.width, viewport.height) <= MOBILE_PSEUDO_FULLSCREEN_BREAKPOINT)
+    );
+  }
+
+  function clearMountFullscreenStyles(element: HTMLElement | null): void {
+    if (!element) return;
+    element.style.position = "";
+    element.style.left = "";
+    element.style.top = "";
+    element.style.right = "";
+    element.style.bottom = "";
+    element.style.transform = "";
+    element.style.zIndex = "";
+    element.style.width = "";
+    element.style.height = "";
+    element.style.maxWidth = "";
+    element.style.maxHeight = "";
+    element.style.borderRadius = "";
+    element.style.background = "";
+  }
 
   function refreshLayoutMetricsFromElements(): void {
     layoutMetrics.rootHeight = Math.max(
@@ -269,10 +371,10 @@ export function createSpectrumRenderController(
     const rootHeight = Math.max(0, layoutMetrics.rootHeight || 0);
     const availableHeight = Math.max(1, rootHeight - SPLITTER_HIT_HEIGHT);
     const minRatio = rootHeight > 0
-      ? clampNumber(MIN_OVERVIEW_SECTION_HEIGHT / availableHeight, 0.08, 0.92)
+      ? clampNumber(MIN_OVERVIEW_SECTION_HEIGHT / availableHeight, 0.05, 0.95)
       : 0.12;
     const maxRatio = rootHeight > 0
-      ? clampNumber(1 - MIN_MAIN_SECTION_HEIGHT / availableHeight, minRatio, 0.92)
+      ? clampNumber(1 - MIN_MAIN_SECTION_HEIGHT / availableHeight, minRatio, 0.95)
       : OVERVIEW_RATIO_FALLBACK;
     return {
       min: Math.min(minRatio, maxRatio),
@@ -308,15 +410,19 @@ export function createSpectrumRenderController(
     const state = getState();
     const interactionState = getInteractionState();
     const mainVisible = !!state.audio && state.sections.main.enabled;
+    const isFullscreen = interactionState.spectrumMainFullscreen === true;
+    const isPseudoFullscreen = isFullscreen && mobilePseudoFullscreen;
+    const viewport = isPseudoFullscreen ? getViewportSize() : { width: 0, height: 0 };
     const overviewVisible = !!state.audio && state.sections.overview.enabled;
     const ratio = resolveOverviewRatio();
-    const isFullscreen = interactionState.spectrumMainFullscreen === true;
     const signature = [
       mainVisible ? 1 : 0,
       overviewVisible ? 1 : 0,
       isFullscreen ? 1 : 0,
+      isPseudoFullscreen ? 1 : 0,
       controlsVisible ? 1 : 0,
       ratio.toFixed(6),
+      isPseudoFullscreen ? `${viewport.width}x${viewport.height}` : "",
     ].join("|");
     if (signature === lastLayoutSignature) {
       return;
@@ -327,6 +433,37 @@ export function createSpectrumRenderController(
       placeholder.style.display = mainVisible || overviewVisible ? "none" : "flex";
     }
 
+    if (mountElement) {
+      mountElement.style.position = isPseudoFullscreen ? "fixed" : "";
+      mountElement.style.left = isPseudoFullscreen ? "50%" : "";
+      mountElement.style.top = isPseudoFullscreen ? "50%" : "";
+      mountElement.style.right = "";
+      mountElement.style.bottom = "";
+      mountElement.style.transform = isPseudoFullscreen ? "translate(-50%, -50%)" : "";
+      mountElement.style.zIndex = isPseudoFullscreen ? "10000" : "";
+      mountElement.style.width = isPseudoFullscreen ? `${viewport.width}px` : isFullscreen ? "100vw" : "";
+      mountElement.style.height = isPseudoFullscreen ? `${viewport.height}px` : isFullscreen ? "100vh" : "";
+      mountElement.style.maxWidth = isPseudoFullscreen ? `${viewport.width}px` : isFullscreen ? "100vw" : "";
+      mountElement.style.maxHeight = isPseudoFullscreen ? `${viewport.height}px` : isFullscreen ? "100vh" : "";
+      mountElement.style.borderRadius = isFullscreen ? "0" : "";
+      mountElement.style.background = isFullscreen ? "rgba(245, 248, 255, 0.96)" : "";
+    }
+
+    if (root) {
+      root.style.position = "relative";
+      root.style.left = "";
+      root.style.top = "";
+      root.style.right = "";
+      root.style.bottom = "";
+      root.style.transform = "";
+      root.style.zIndex = "";
+      root.style.width = "100%";
+      root.style.height = "100%";
+      root.style.maxWidth = "";
+      root.style.maxHeight = "";
+      root.style.background = "transparent";
+    }
+
     if (mainFullscreenToggle) {
       mainFullscreenToggle.disabled = !mainVisible;
       mainFullscreenToggle.textContent = isFullscreen ? "⤡" : "⛶";
@@ -335,19 +472,20 @@ export function createSpectrumRenderController(
     }
 
     if (toolbar) {
+      const toolbarVisible = (controlsVisible || isFullscreen) && mainVisible;
       toolbar.style.display = mainVisible ? "flex" : "none";
-      toolbar.style.opacity = controlsVisible && mainVisible ? "1" : "0";
-      toolbar.style.transform = controlsVisible && mainVisible ? "translateY(0)" : "translateY(-4px)";
-      toolbar.style.pointerEvents = controlsVisible && mainVisible ? "auto" : "none";
+      toolbar.style.opacity = toolbarVisible ? "1" : "0";
+      toolbar.style.transform = toolbarVisible ? "translateY(0)" : "translateY(-4px)";
+      toolbar.style.pointerEvents = toolbarVisible ? "auto" : "none";
     }
 
     if (splitBar) {
-      splitBar.style.display = mainVisible && overviewVisible && !isFullscreen ? "" : "none";
-      splitBar.style.opacity = isFullscreen ? "0" : "0.06";
-      splitBar.style.cursor = isFullscreen ? "default" : "row-resize";
+      splitBar.style.display = mainVisible && overviewVisible ? "" : "none";
+      splitBar.style.opacity = "0.06";
+      splitBar.style.cursor = "row-resize";
     }
     if (splitBarHandle) {
-      splitBarHandle.style.opacity = isFullscreen ? "0" : "0.16";
+      splitBarHandle.style.opacity = "0.16";
     }
 
     if (overviewSection) {
@@ -364,38 +502,112 @@ export function createSpectrumRenderController(
         ? `${1 - ratio} ${1 - ratio} 0px`
         : "1 1 auto";
       mainSection.style.minHeight = isFullscreen ? "0px" : `${MIN_MAIN_SECTION_HEIGHT}px`;
+      mainSection.style.position = "relative";
+      mainSection.style.left = "";
+      mainSection.style.top = "";
+      mainSection.style.right = "";
+      mainSection.style.bottom = "";
+      mainSection.style.transform = "";
+      mainSection.style.zIndex = "";
+      mainSection.style.width = "100%";
+      mainSection.style.height = "";
+      mainSection.style.maxWidth = "";
+      mainSection.style.maxHeight = "";
       mainSection.style.border = isFullscreen ? "0" : "1px solid rgba(54, 80, 130, 0.08)";
       mainSection.style.borderRadius = isFullscreen ? "0" : "0";
-      mainSection.style.background = isFullscreen ? "transparent" : "rgba(245, 248, 255, 0.9)";
+      mainSection.style.background = isFullscreen ? "rgba(245, 248, 255, 0.96)" : "rgba(245, 248, 255, 0.9)";
       mainSection.style.boxShadow = isFullscreen ? "none" : "inset 0 1px 0 rgba(255, 255, 255, 0.72), 0 10px 24px rgba(19, 37, 70, 0.08)";
     }
   }
 
-  function syncFullscreenStateFromDocument(): void {
-    const interactionState = getInteractionState();
-    const isFullscreen = documentRef?.fullscreenElement === mainSection;
-    if (interactionState.spectrumMainFullscreen === isFullscreen) {
+  function forceViewportRelayout(): void {
+    refreshLayoutMetricsFromElements();
+    applySectionLayout();
+    refreshLayoutMetricsFromElements();
+    syncCanvasSizes();
+    schedule(
+      DIRTY.MAIN_BASE |
+        DIRTY.MAIN_OVERLAY |
+        DIRTY.OVERVIEW_BASE |
+        DIRTY.OVERVIEW_OVERLAY,
+    );
+  }
+
+  function queueViewportRelayout(): void {
+    if (!windowRef || typeof windowRef.requestAnimationFrame !== "function") {
+      forceViewportRelayout();
       return;
     }
-    interactionState.spectrumMainFullscreen = isFullscreen;
-    applySectionLayout();
-    schedule(DIRTY.MAIN_BASE | DIRTY.MAIN_OVERLAY | DIRTY.OVERVIEW_OVERLAY);
+    if (fullscreenRelayoutRafId !== null) {
+      windowRef.cancelAnimationFrame(fullscreenRelayoutRafId);
+      fullscreenRelayoutRafId = null;
+    }
+    let remainingPasses = 2;
+    const run = () => {
+      fullscreenRelayoutRafId = null;
+      forceViewportRelayout();
+      remainingPasses -= 1;
+      if (remainingPasses > 0) {
+        fullscreenRelayoutRafId = windowRef.requestAnimationFrame(run);
+      }
+    };
+    fullscreenRelayoutRafId = windowRef.requestAnimationFrame(run);
+  }
+
+  function syncFullscreenStateFromDocument(): void {
+    const interactionState = getInteractionState();
+    const fullscreenTarget = mountElement || root || mainSection;
+    const isFullscreen = !!fullscreenTarget && getFullscreenElement(documentRef) === fullscreenTarget;
+    if (!isFullscreen && mobilePseudoFullscreen) {
+      queueViewportRelayout();
+      return;
+    }
+    mobilePseudoFullscreen = false;
+    if (interactionState.spectrumMainFullscreen !== isFullscreen) {
+      interactionState.spectrumMainFullscreen = isFullscreen;
+      applySectionLayout();
+    }
+    queueViewportRelayout();
   }
 
   async function setMainFullscreen(nextFullscreen: boolean): Promise<void> {
     const next = !!nextFullscreen;
-    const isFullscreen = documentRef?.fullscreenElement === mainSection;
+    const fullscreenTarget = mountElement || root || mainSection;
+    const isFullscreen =
+      mobilePseudoFullscreen ||
+      (!!fullscreenTarget && getFullscreenElement(documentRef) === fullscreenTarget);
     if (next === isFullscreen) {
+      queueViewportRelayout();
       return;
     }
-    if (!mainSection) {
+    if (!mainSection || !fullscreenTarget) {
       return;
     }
     try {
       if (next) {
-        await mainSection.requestFullscreen();
-      } else if (documentRef?.fullscreenElement) {
-        await documentRef.exitFullscreen();
+        if (shouldUseMobilePseudoFullscreen()) {
+          mobilePseudoFullscreen = true;
+          getInteractionState().spectrumMainFullscreen = true;
+          controlsVisible = true;
+          queueViewportRelayout();
+          return;
+        }
+        mobilePseudoFullscreen = false;
+        await requestElementFullscreen(fullscreenTarget);
+      } else {
+        if (mobilePseudoFullscreen) {
+          mobilePseudoFullscreen = false;
+          getInteractionState().spectrumMainFullscreen = false;
+          queueViewportRelayout();
+          return;
+        }
+        if (getFullscreenElement(documentRef)) {
+          await exitFullscreenDocument(documentRef);
+        } else {
+          getInteractionState().spectrumMainFullscreen = false;
+          queueViewportRelayout();
+          return;
+        }
       }
     } catch (error) {
       console.warn(
@@ -445,7 +657,7 @@ export function createSpectrumRenderController(
     }
     if (overviewOverlay) {
       const nextDisplay =
-        hasAudio && state.sections.overview.enabled && !getInteractionState().spectrumMainFullscreen && state.sections.overview.overlay ? "" : "none";
+        hasAudio && state.sections.overview.enabled && state.sections.overview.overlay ? "" : "none";
       if (overviewOverlay.style.display !== nextDisplay) {
         overviewOverlay.style.display = nextDisplay;
       }
@@ -846,6 +1058,7 @@ export function createSpectrumRenderController(
 
   function runFrameTick(): void {
     syncSectionVisibility();
+    refreshLayoutMetricsFromElements();
     const state = getState();
     if (!state.audio) {
       dirtyMask = 0;
@@ -880,7 +1093,11 @@ export function createSpectrumRenderController(
 
   function runOverviewOverlayTask(): void {
     const state = getState();
-    if (!state.audio || !state.sections.overview.enabled || !state.sections.overview.overlay) {
+    if (
+      !state.audio ||
+      !state.sections.overview.enabled ||
+      !state.sections.overview.overlay
+    ) {
       clearDirtyBits(DIRTY.OVERVIEW_OVERLAY);
       return;
     }
@@ -1035,33 +1252,53 @@ export function createSpectrumRenderController(
     width: number,
     height: number,
     maxDpr = Number.POSITIVE_INFINITY,
-  ): void {
+  ): boolean {
     const dpr = Math.max(
       1,
       Math.min(maxDpr, windowRef?.devicePixelRatio || 1),
     );
     const nextWidth = Math.max(1, Math.floor(Math.max(1, width) * dpr));
     const nextHeight = Math.max(1, Math.floor(Math.max(1, height) * dpr));
-    if (canvas.width !== nextWidth) canvas.width = nextWidth;
-    if (canvas.height !== nextHeight) canvas.height = nextHeight;
+    let resized = false;
+    if (canvas.width !== nextWidth) {
+      canvas.width = nextWidth;
+      resized = true;
+    }
+    if (canvas.height !== nextHeight) {
+      canvas.height = nextHeight;
+      resized = true;
+    }
+    return resized;
   }
 
   function syncCanvasSizes(): void {
+    let resizedMask = 0;
     if (mainSection && mainBase && mainOverlay) {
-      resizeCanvas(mainBase, layoutMetrics.mainWidth, layoutMetrics.mainHeight);
-      resizeCanvas(mainOverlay, layoutMetrics.mainWidth, layoutMetrics.mainHeight);
+      if (resizeCanvas(mainBase, layoutMetrics.mainWidth, layoutMetrics.mainHeight)) {
+        resizedMask |= DIRTY.MAIN_BASE;
+      }
+      if (resizeCanvas(mainOverlay, layoutMetrics.mainWidth, layoutMetrics.mainHeight)) {
+        resizedMask |= DIRTY.MAIN_OVERLAY;
+      }
     }
     if (overviewSection && overviewBase && overviewOverlay) {
-      resizeCanvas(
+      if (resizeCanvas(
         overviewBase,
         layoutMetrics.overviewWidth,
         layoutMetrics.overviewHeight,
-      );
-      resizeCanvas(
+      )) {
+        resizedMask |= DIRTY.OVERVIEW_BASE;
+      }
+      if (resizeCanvas(
         overviewOverlay,
         layoutMetrics.overviewWidth,
         layoutMetrics.overviewHeight,
-      );
+      )) {
+        resizedMask |= DIRTY.OVERVIEW_OVERLAY;
+      }
+    }
+    if (resizedMask) {
+      dirtyMask |= resizedMask;
     }
   }
 
@@ -1199,17 +1436,56 @@ export function createSpectrumRenderController(
       const handleFullscreenError = () => {
         syncFullscreenStateFromDocument();
       };
-      documentRef.addEventListener("fullscreenchange", handleFullscreenChange);
-      documentRef.addEventListener("fullscreenerror", handleFullscreenError);
+      const fullscreenEvents: Array<[string, EventListener]> = [
+        ["fullscreenchange", handleFullscreenChange],
+        ["fullscreenerror", handleFullscreenError],
+        ["webkitfullscreenchange", handleFullscreenChange],
+        ["webkitfullscreenerror", handleFullscreenError],
+      ];
+      for (const [type, listener] of fullscreenEvents) {
+        documentRef.addEventListener(type, listener);
+      }
       fullscreenCleanup = () => {
-        documentRef.removeEventListener("fullscreenchange", handleFullscreenChange);
-        documentRef.removeEventListener("fullscreenerror", handleFullscreenError);
+        for (const [type, listener] of fullscreenEvents) {
+          documentRef.removeEventListener(type, listener);
+        }
       };
       cleanups.push(() => {
         fullscreenCleanup?.();
         fullscreenCleanup = null;
       });
     }
+    const windowResizeListeners: Array<[string, EventListener]> = [];
+    const handleViewportResize = () => {
+      queueViewportRelayout();
+    };
+    if (windowRef && typeof windowRef.addEventListener === "function") {
+      windowResizeListeners.push(["resize", handleViewportResize]);
+      windowResizeListeners.push(["orientationchange", handleViewportResize]);
+      for (const [type, listener] of windowResizeListeners) {
+        windowRef.addEventListener(type, listener);
+      }
+    }
+    const visualViewport = windowRef?.visualViewport ?? null;
+    if (visualViewport && typeof visualViewport.addEventListener === "function") {
+      visualViewport.addEventListener("resize", handleViewportResize);
+      visualViewport.addEventListener("scroll", handleViewportResize);
+      cleanups.push(() => {
+        visualViewport.removeEventListener("resize", handleViewportResize);
+        visualViewport.removeEventListener("scroll", handleViewportResize);
+      });
+    }
+    cleanups.push(() => {
+      if (windowRef && typeof windowRef.removeEventListener === "function") {
+        for (const [type, listener] of windowResizeListeners) {
+          windowRef.removeEventListener(type, listener);
+        }
+      }
+      if (fullscreenRelayoutRafId !== null && windowRef) {
+        windowRef.cancelAnimationFrame(fullscreenRelayoutRafId);
+        fullscreenRelayoutRafId = null;
+      }
+    });
     const splitDraggingState = {
       active: false,
       pointerId: -1,
@@ -1398,6 +1674,10 @@ export function createSpectrumRenderController(
   }
 
   function mount(nextMount: HTMLElement | null): void {
+    if (mountElement && mountElement !== nextMount) {
+      clearMountFullscreenStyles(mountElement);
+    }
+    mountElement = nextMount;
     const nextRoot = createRoot();
     if (nextRoot) {
       if (nextMount) {
@@ -1499,9 +1779,12 @@ export function createSpectrumRenderController(
   }
 
   function destroy(): void {
-    if (documentRef?.fullscreenElement === mainSection && documentRef.exitFullscreen) {
-      void documentRef.exitFullscreen().catch(() => undefined);
+    const fullscreenTarget = mountElement || root || mainSection;
+    if (fullscreenTarget && getFullscreenElement(documentRef) === fullscreenTarget) {
+      void exitFullscreenDocument(documentRef).catch(() => undefined);
     }
+    mobilePseudoFullscreen = false;
+    clearMountFullscreenStyles(mountElement);
     resizeObserver?.disconnect();
     resizeObserver = null;
     audioCleanup?.();
@@ -1524,11 +1807,16 @@ export function createSpectrumRenderController(
     schedulerStarted = false;
     taskRateSignature = "";
     dirtyMask = 0;
+    if (fullscreenRelayoutRafId !== null && windowRef) {
+      windowRef.cancelAnimationFrame(fullscreenRelayoutRafId);
+      fullscreenRelayoutRafId = null;
+    }
     
     if (root?.parentElement) {
       root.parentElement.removeChild(root);
     }
     root = null;
+    mountElement = null;
     placeholder = null;
     splitBar = null;
     splitBarHandle = null;

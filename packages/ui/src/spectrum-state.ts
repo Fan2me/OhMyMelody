@@ -12,7 +12,7 @@ export const DEFAULT_MAIN_FPS = 60;
 export const DEFAULT_OVERVIEW_FPS = 24;
 export const DEFAULT_MAIN_HEIGHT = 360;
 export const DEFAULT_OVERVIEW_HEIGHT = 96;
-export const DEFAULT_OVERVIEW_RATIO = 0.15;
+export const DEFAULT_OVERVIEW_RATIO = 0.10;
 const OVERVIEW_RATIO_STORAGE_KEY = "ohmymelody.ui.spectrum.overviewRatio.v1";
 
 export interface SpectrumSectionConfig {
