@@ -10,6 +10,7 @@ export * from './file/file-key.js';
 export * from './inference/inference.js';
 export * from './media/element-capture.js';
 export * from './media/capture.js';
+export * from './media/decode.js';
 export * from './media/stream-capture.js';
 export * from './media/transcode.js';
 export * from './model-catalog.js';

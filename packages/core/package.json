@@ -28,7 +28,6 @@
     "clean": "node ../../scripts/clean.mjs"
   },
   "dependencies": {
-    "@ffmpeg/ffmpeg": "^0.12.15",
-    "@ffmpeg/util": "^0.12.1"
+    "mediabunny": "^1.44.2"
   }
 }

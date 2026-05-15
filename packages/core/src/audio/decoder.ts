@@ -4,6 +4,8 @@ import {
   readFileAsArrayBuffer,
 } from "./pcm.js";
 import { captureAudioFromMediaElement } from "../media/element-capture.js";
+import { decodeMediaAudioTrack } from "../media/decode.js";
+import { isVideoLikeMediaFile } from "../media/transcode.js";
 import { getModuleLogger } from "../logging/logger.js";
 
 const logger = getModuleLogger("core.audio.decoder");
@@ -92,6 +94,10 @@ async function decodeAudioBufferNative(
 export async function decodeAudioRaw(
   file: File | Blob,
 ): Promise<DecodedAudioResult> {
+  if (isVideoLikeMediaFile(file)) {
+    return decodeMediaAudioTrack(file);
+  }
+
   const audioCtx = await createAudioContextInstance();
   try {
     const arrayBuffer = await readFileAsArrayBuffer(file);
