@@ -47,6 +47,7 @@ test("buildSpectrumTimeline keeps CFP frame layout intact", () => {
   const timeline = buildSpectrumTimeline(slots);
 
   assert.equal(timeline.segments.length, 2);
+  assert.equal(timeline.frames.length, 4);
   assert.equal(timeline.totalFrames, 4);
   assert.equal(timeline.freqCount, 3);
   assert.equal(timeline.min, 0);
@@ -55,6 +56,8 @@ test("buildSpectrumTimeline keeps CFP frame layout intact", () => {
   assert.equal(timeline.segments[0].frameCount, 2);
   assert.equal(timeline.segments[0].freqCount, 3);
   assert.deepEqual(timeline.segments[0].batchFrameStarts, [0]);
+  assert.equal(timeline.frames[0].globalFrame, 0);
+  assert.equal(timeline.frames[3].globalFrame, 3);
   assert.equal(timeline.segments[1].slotIndex, 1);
   assert.equal(timeline.segments[1].frameCount, 2);
 });

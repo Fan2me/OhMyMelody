@@ -5,6 +5,7 @@ export interface ProgressiveSpectrumState {
   spectrumData: Float32Array;
   spectrumW: number;
   spectrumH: number;
+  spectrumRevision: number;
   sourceFrameOffset: number;
   windowFrameCount: number;
   predictionArgmax: Float32Array;
@@ -18,6 +19,7 @@ export interface ProgressiveSpectrumPayload {
   data: Float32Array;
   width: number;
   height: number;
+  spectrumRevision?: number;
   argmax: Float32Array;
   confidence: Float32Array;
 }
@@ -152,6 +154,7 @@ export function createProgressiveSpectrumVisualizer(
     spectrumData,
     spectrumW: 0,
     spectrumH: height,
+    spectrumRevision: 0,
     sourceFrameOffset: 0,
     windowFrameCount: 0,
     predictionArgmax,
@@ -165,6 +168,7 @@ export function createProgressiveSpectrumVisualizer(
     if (Object.prototype.hasOwnProperty.call(next, "spectrumData")) state.spectrumData = next.spectrumData ?? state.spectrumData;
     if (Object.prototype.hasOwnProperty.call(next, "spectrumW")) state.spectrumW = next.spectrumW ?? state.spectrumW;
     if (Object.prototype.hasOwnProperty.call(next, "spectrumH")) state.spectrumH = next.spectrumH ?? state.spectrumH;
+    if (Object.prototype.hasOwnProperty.call(next, "spectrumRevision")) state.spectrumRevision = next.spectrumRevision ?? state.spectrumRevision;
     if (Object.prototype.hasOwnProperty.call(next, "sourceFrameOffset")) state.sourceFrameOffset = next.sourceFrameOffset ?? state.sourceFrameOffset;
     if (Object.prototype.hasOwnProperty.call(next, "windowFrameCount")) state.windowFrameCount = next.windowFrameCount ?? state.windowFrameCount;
     if (Object.prototype.hasOwnProperty.call(next, "predictionArgmax")) state.predictionArgmax = next.predictionArgmax ?? state.predictionArgmax;
@@ -207,6 +211,10 @@ export function createProgressiveSpectrumVisualizer(
     const prevArgmax = predictionArgmax;
     const prevConfidence = predictionConfidence;
     const prevHeight = height;
+    const prevSourceFrameOffset = state.sourceFrameOffset;
+    const prevWindowFrameCount = state.windowFrameCount;
+    const prevWriteFrameOffset = state.writeFrameOffset;
+    const prevRenderedFrames = state.renderedFrames;
     totalFrames = safeTotalFrames;
 
     const blank = createBlankProgressiveSpectrumPayload(safeTotalFrames, height);
@@ -227,17 +235,25 @@ export function createProgressiveSpectrumVisualizer(
     spectrumData = blank.spectrumData;
     predictionArgmax = blank.predictionArgmax;
     predictionConfidence = blank.predictionConfidence;
+    const nextWindowFrameCount = preserveExisting
+      ? Math.min(safeTotalFrames, Math.max(0, prevWindowFrameCount))
+      : 0;
     syncState({
       spectrumData,
       spectrumW: blank.spectrumW,
       spectrumH: blank.spectrumH,
+      spectrumRevision: state.spectrumRevision + 1,
       predictionArgmax,
       predictionConfidence,
       predictionRevision: state.predictionRevision + 1,
-      sourceFrameOffset: 0,
-      windowFrameCount: 0,
-      writeFrameOffset: 0,
-      renderedFrames: 0,
+      sourceFrameOffset: preserveExisting ? prevSourceFrameOffset : 0,
+      windowFrameCount: nextWindowFrameCount,
+      writeFrameOffset: preserveExisting
+        ? Math.min(nextWindowFrameCount, Math.max(0, prevWriteFrameOffset))
+        : 0,
+      renderedFrames: preserveExisting
+        ? Math.min(safeTotalFrames, Math.max(0, prevRenderedFrames))
+        : 0,
     });
 
     const resolvedDurationSec = Math.max(
@@ -253,6 +269,7 @@ export function createProgressiveSpectrumVisualizer(
         data: blank.spectrumData,
         width: blank.spectrumW,
         height: blank.spectrumH,
+        spectrumRevision: state.spectrumRevision,
         argmax: blank.predictionArgmax,
         confidence: blank.predictionConfidence,
       });
@@ -270,7 +287,7 @@ export function createProgressiveSpectrumVisualizer(
 
   /**
    * 处理队列中的所有 CFP 数据块，将频谱数据写入可视化缓冲区
-   * 实现滑动窗口机制：数据溢出时自动左移旧数据
+   * 渐进式数据始终从 0 开始追加到整体数组；容量不足时扩容，不因窗口移动重排历史帧
    */
   function drainQueuedChunks() {
     queued = false;  // 清除调度标志
@@ -296,54 +313,27 @@ export function createProgressiveSpectrumVisualizer(
       // 计算实际使用的通道和频率维度
       const useC = Math.max(0, Math.min(C - 1, 0));  // 使用第一个通道
       const useF = Math.min(state.spectrumH, F);    // 限制频率数不超过窗口高度
-      const currentCount = state.windowFrameCount;  // 当前窗口中已有的帧数
+      let currentCount = state.windowFrameCount;  // 当前整体数组中已有的帧数
+      const requiredFrameCount = currentCount + T;
+      if (requiredFrameCount > state.spectrumW && state.spectrumW < maxWindowFrames) {
+        ensureBase(requiredFrameCount, pendingDurationSec, true, true);
+        currentCount = state.windowFrameCount;
+      }
 
-      // 模式 A：当前 chunk 足够填满整个窗口
-      if (T >= state.spectrumW) {
-        // 取 chunk 的最后 spectrumW 帧，直接填满窗口
-        const srcStartT = T - state.spectrumW;
+      const xOffset = currentCount;  // 新数据的写入起始位置
+      const writableFrames = Math.min(T, Math.max(0, state.spectrumW - xOffset));
+      for (let t = 0; t < writableFrames; t += 1) {
         for (let f = 0; f < useF; f += 1) {
-          const channelOffset = useC * F * T;
-          const freqOffset = f * T;
-          const srcStart = channelOffset + freqOffset + srcStartT;  // 源数据起始索引
-          const srcEnd = channelOffset + freqOffset + T;              // 源数据结束索引
-          const dstStart = f * state.spectrumW;                // 目标数据起始索引
-          state.spectrumData.set(one.data.subarray(srcStart, srcEnd), dstStart);
+          const src = useC * F * T + f * T + t;  // 源数据索引
+          const dst = f * state.spectrumW + (xOffset + t);  // 目标数据索引
+          state.spectrumData[dst] = Number(one.data[src] ?? NaN);
         }
-        state.windowFrameCount = state.spectrumW;  // 窗口已满
-        state.writeFrameOffset = state.spectrumW;
       }
-      // 模式 B：chunk 较小，需要滚动窗口
-      else {
-        let xOffset = currentCount;  // 新数据的写入起始位置
-        // 计算溢出量：当前帧数 + 新帧数 - 窗口宽度
-        const overflow = currentCount + T - state.spectrumW;
-        if (overflow > 0) {
-          // 左移频谱数据，为新数据腾出空间
-          for (let f = 0; f < state.spectrumH; f += 1) {
-            const rowStart = f * state.spectrumW;
-            state.spectrumData.copyWithin(rowStart, rowStart + overflow, rowStart + currentCount);
-          }
-          // 同样左移预测数据
-          state.predictionArgmax.copyWithin(0, overflow, currentCount);
-          state.predictionConfidence.copyWithin(0, overflow, currentCount);
-          xOffset = currentCount - overflow;  // 更新写入位置
-        }
-
-        // 将新 chunk 的数据写入窗口右侧空闲区域
-        for (let t = 0; t < Math.min(T, Math.max(0, state.spectrumW - xOffset)); t += 1) {
-          for (let f = 0; f < useF; f += 1) {
-            const src = useC * F * T + f * T + t;  // 源数据索引
-            const dst = f * state.spectrumW + (xOffset + t);  // 目标数据索引
-            state.spectrumData[dst] = Number(one.data[src] ?? NaN);
-          }
-        }
-        state.windowFrameCount = Math.min(state.spectrumW, xOffset + T);  // 更新窗口帧数
-        state.writeFrameOffset = state.windowFrameCount;
-      }
+      state.windowFrameCount = Math.min(state.spectrumW, xOffset + writableFrames);  // 更新整体数组帧数
+      state.writeFrameOffset = state.windowFrameCount;
 
       state.sourceFrameOffset += T;  // 更新已处理的源数据帧偏移
-      touched = true;
+      touched = touched || writableFrames > 0;
     }
 
     // 清空队列
@@ -352,6 +342,7 @@ export function createProgressiveSpectrumVisualizer(
 
     // 如果有数据被处理，触发重绘
     if (touched) {
+      state.spectrumRevision += 1;
       markDirty();
       requestRedraw({ dirtyMask: DIRTY.MAIN_BASE });
     }
@@ -377,7 +368,7 @@ export function createProgressiveSpectrumVisualizer(
 
     const start = Math.max(0, Math.floor(Number.isFinite(args.predictionOffset as number) ? Number(args.predictionOffset) : 0));
     // 计算最大可复制长度：不超过窗口剩余空间和预测数据长度
-    const maxCopy = Math.min(state.spectrumW - start, Number(predictionArgmax.length) || 0);
+    const maxCopy = Math.max(0, Math.min(state.spectrumW - start, Number(predictionArgmax.length) || 0));
 
     // 写入预测的音高类别索引
     for (let i = 0; i < maxCopy; i += 1) {
@@ -387,7 +378,7 @@ export function createProgressiveSpectrumVisualizer(
 
     // 写入预测置信度（如果有）
     if (predictionConfidence) {
-      const confCopy = Math.min(state.spectrumW - start, Number(predictionConfidence.length) || 0);
+      const confCopy = Math.max(0, Math.min(state.spectrumW - start, Number(predictionConfidence.length) || 0));
       for (let i = 0; i < confCopy; i += 1) {
         state.predictionConfidence[start + i] = Number(predictionConfidence[i] ?? 0);
       }
@@ -432,6 +423,7 @@ export function createProgressiveSpectrumVisualizer(
         spectrumData,
         spectrumW: 0,
         spectrumH: height,
+        spectrumRevision: state.spectrumRevision + 1,
         predictionArgmax,
         predictionConfidence,
         predictionRevision: state.predictionRevision,

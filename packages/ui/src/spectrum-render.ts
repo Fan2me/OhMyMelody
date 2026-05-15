@@ -1,4 +1,5 @@
 import {
+  buildSpectrumTimeline,
   benchmarkHeatmapTimelineRender,
   renderHeatmapTimeline,
   type HeatmapBenchmarkEntry,
@@ -6,6 +7,7 @@ import {
   type HeatmapOptimizationLevel,
   type HeatmapTimeline,
 } from "./heatmap-render-core.js";
+import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import { getModuleLogger } from "@ohm/core/logging/logger.js";
 import { RafScheduler } from "@ohm/core/scheduler/scheduler.js";
 import {
@@ -33,12 +35,14 @@ import type {
 import type {
   SpectrumOverviewOverlayRenderer,
 } from "./spectrum-overview-overlay.js";
+import type { ProgressiveSpectrumPayload } from "./progressive-spectrum-visualizer.js";
 
 export interface SpectrumRenderControllerDeps {
   windowRef: Window | null;
   documentRef: Document | null;
   getState: () => SpectrumUiState;
   getInteractionState: () => SpectrumInteractionState;
+  getSpectrumPayload: () => ProgressiveSpectrumPayload | null;
   mainOverlayRenderer: SpectrumMainOverlayRenderer;
   overviewOverlayRenderer: SpectrumOverviewOverlayRenderer;
 }
@@ -117,6 +121,51 @@ function drawHeatmap(
     optimizationLevel,
   );
 }
+
+function buildTimelineFromSpectrumPayload(
+  payload: ProgressiveSpectrumPayload | null,
+): HeatmapTimeline | null {
+  if (!payload || !(payload.data instanceof Float32Array)) {
+    return null;
+  }
+  const width = Math.max(1, Math.floor(Number(payload.width) || 0));
+  const height = Math.max(1, Math.floor(Number(payload.height) || 0));
+  if (!width || !height || payload.data.length < width * height) {
+    return null;
+  }
+  const revision = Math.max(0, Math.floor(Number(payload.spectrumRevision) || 0));
+  const cached = spectrumPayloadTimelineCache.get(payload.data);
+  if (
+    cached &&
+    cached.width === width &&
+    cached.height === height &&
+    cached.revision === revision
+  ) {
+    return cached.timeline;
+  }
+  const syntheticBatch = {
+    data: payload.data,
+    shape: new Int32Array([1, height, width]),
+  } as CFPBatch;
+  const timeline = buildSpectrumTimeline([[syntheticBatch]]);
+  spectrumPayloadTimelineCache.set(payload.data, {
+    width,
+    height,
+    revision,
+    timeline,
+  });
+  return timeline;
+}
+
+const spectrumPayloadTimelineCache = new WeakMap<
+  Float32Array,
+  {
+    width: number;
+    height: number;
+    revision: number;
+    timeline: HeatmapTimeline;
+  }
+>();
 
 function getClientPointFromEvent(event: MouseEvent | PointerEvent | TouchEvent | null) {
   if (!event) return null;
@@ -200,6 +249,7 @@ export function createSpectrumRenderController(
     documentRef,
     getState,
     getInteractionState,
+    getSpectrumPayload,
     mainOverlayRenderer,
     overviewOverlayRenderer,
   } = deps;
@@ -240,7 +290,6 @@ export function createSpectrumRenderController(
   let playing = false;
   let lastAutoPanAt = 0;
   let autoPanSuppressedUntil = 0;
-  let timeline: HeatmapTimeline | null = null;
   let fullscreenCleanup: (() => void) | null = null;
   let mobilePseudoFullscreen = false;
   let controlsVisible = false;
@@ -260,6 +309,10 @@ export function createSpectrumRenderController(
   let splitDragRootTop = 0;
   let splitDragRootHeight = 0;
   let lastLayoutSignature = "";
+
+  function getHeatmapTimeline(): HeatmapTimeline | null {
+    return buildTimelineFromSpectrumPayload(getSpectrumPayload());
+  }
 
   const AUTO_PAN_MIN_INTERVAL_MS = 33;
   const AUTO_PAN_EDGE_RATIO = 1 / 10;
@@ -759,10 +812,11 @@ export function createSpectrumRenderController(
 
   function resolveSpectrumFrequencyViewport(
     state: SpectrumUiState,
+    renderTimeline: HeatmapTimeline | null,
   ): HeatmapFrequencyViewport {
     const spectrumBinCount = Math.max(
       1,
-      Math.floor(getInteractionState().spectrumH || timeline?.freqCount || 1),
+      Math.floor(getInteractionState().spectrumH || renderTimeline?.freqCount || 1),
     );
     const frequencyViewport: HeatmapFrequencyViewport = {
       minBin: Math.max(
@@ -789,13 +843,17 @@ export function createSpectrumRenderController(
     state: SpectrumUiState;
     canvas: HTMLCanvasElement | null;
     ctx: CanvasRenderingContext2D | null;
+    timeline: HeatmapTimeline | null;
     viewport: { startSlot: number; endSlot: number };
     representativeMode: string;
     frequencyViewport: HeatmapFrequencyViewport;
     sampleStrideFrames: number;
   }): void {
-    const { target, now, canvas, ctx, viewport, representativeMode, frequencyViewport, sampleStrideFrames } = args;
+    const { canvas, ctx, timeline, viewport, representativeMode, frequencyViewport, sampleStrideFrames } = args;
     if (!canvas || !ctx) {
+      return;
+    }
+    if (!timeline) {
       return;
     }
     const renderLogKey = [
@@ -1128,7 +1186,12 @@ export function createSpectrumRenderController(
     if (!shouldDraw) {
       return;
     }
-    const frequencyViewport = resolveSpectrumFrequencyViewport(state);
+    const renderTimeline = getHeatmapTimeline();
+    if (!renderTimeline) {
+      clearDirtyBits(DIRTY.MAIN_BASE);
+      return;
+    }
+    const frequencyViewport = resolveSpectrumFrequencyViewport(state, renderTimeline);
     const interactionState = getInteractionState();
     const mainViewW = getMainViewFrameCount(interactionState);
     const mainSampleStrideFrames = Math.max(
@@ -1137,7 +1200,7 @@ export function createSpectrumRenderController(
         zoom: interactionState.spectrumZoom,
         minZoom: 1,
         maxZoom: getDisplayMaxZoomForTotalFrames({
-          totalFrames: interactionState.spectrumW || timeline?.totalFrames || 0,
+          totalFrames: interactionState.spectrumW || renderTimeline.totalFrames || 0,
           maxUnitsPerSecond: state.displaySampling.maxUnitsPerSecond,
         }),
         minUnitsPerSecond: state.displaySampling.minUnitsPerSecond,
@@ -1150,7 +1213,7 @@ export function createSpectrumRenderController(
       endSlot: Math.max(
         1,
         Math.min(
-          interactionState.spectrumW || timeline?.totalFrames || 0,
+          interactionState.spectrumW || renderTimeline.totalFrames || 0,
           Math.floor(interactionState.spectrumOffset + mainViewW),
         ),
       ),
@@ -1161,6 +1224,7 @@ export function createSpectrumRenderController(
       state,
       canvas: mainBase,
       ctx: mainBaseCtx,
+      timeline: renderTimeline,
       viewport: mainViewport,
       representativeMode: state.displaySampling?.representativeMode || "first-valid",
       frequencyViewport,
@@ -1184,11 +1248,16 @@ export function createSpectrumRenderController(
     if (!shouldDraw) {
       return;
     }
-    const frequencyViewport = resolveSpectrumFrequencyViewport(state);
+    const renderTimeline = getHeatmapTimeline();
+    if (!renderTimeline) {
+      clearDirtyBits(DIRTY.OVERVIEW_BASE);
+      return;
+    }
+    const frequencyViewport = resolveSpectrumFrequencyViewport(state, renderTimeline);
     const interactionState = getInteractionState();
     const overviewTotalFrames = Math.max(
       1,
-      Math.floor(interactionState.spectrumW || timeline?.totalFrames || 0),
+      Math.floor(interactionState.spectrumW || renderTimeline.totalFrames || 0),
     );
     const overviewSampleStrideFrames = Math.max(
       1,
@@ -1211,6 +1280,7 @@ export function createSpectrumRenderController(
       state,
       canvas: overviewBase,
       ctx: overviewBaseCtx,
+      timeline: renderTimeline,
       viewport: {
         startSlot: 0,
         endSlot: overviewTotalFrames,
@@ -1691,8 +1761,7 @@ export function createSpectrumRenderController(
     schedule();
   }
 
-  function setTimeline(nextTimeline: HeatmapTimeline | null): void {
-    timeline = nextTimeline;
+  function setTimeline(_nextTimeline: HeatmapTimeline | null): void {
     schedule(DIRTY.MAIN_BASE | DIRTY.OVERVIEW_BASE);
   }
 
@@ -1722,15 +1791,28 @@ export function createSpectrumRenderController(
   }
 
   function runHeatmapBenchmark(rounds = 3): HeatmapBenchmarkEntry[] {
-    if (!timeline || !mainBase || !mainBaseCtx) {
+    const renderTimeline = getHeatmapTimeline();
+    if (!renderTimeline || !mainBase || !mainBaseCtx) {
       return [];
     }
     const state = getState();
     const interactionState = getInteractionState();
-    const spectrumBinCount = Math.max(1, Math.floor(interactionState.spectrumH || timeline.freqCount || 1));
+    const spectrumBinCount = Math.max(
+      1,
+      Math.floor(interactionState.spectrumH || renderTimeline.freqCount || 1),
+    );
     const frequencyViewport: HeatmapFrequencyViewport = {
-      minBin: Math.max(0, Math.min(spectrumBinCount - 1, Math.floor(state.pitchRange.minBin || 0))),
-      maxBin: Math.max(0, Math.min(spectrumBinCount - 1, Math.floor(state.pitchRange.maxBin || (spectrumBinCount - 1)))),
+      minBin: Math.max(
+        0,
+        Math.min(spectrumBinCount - 1, Math.floor(state.pitchRange.minBin || 0)),
+      ),
+      maxBin: Math.max(
+        0,
+        Math.min(
+          spectrumBinCount - 1,
+          Math.floor(state.pitchRange.maxBin || (spectrumBinCount - 1)),
+        ),
+      ),
     };
     if (frequencyViewport.maxBin < frequencyViewport.minBin) {
       frequencyViewport.maxBin = frequencyViewport.minBin;
@@ -1741,7 +1823,7 @@ export function createSpectrumRenderController(
       endSlot: Math.max(
         1,
         Math.min(
-          interactionState.spectrumW || timeline.totalFrames || 0,
+          interactionState.spectrumW || renderTimeline.totalFrames || 0,
           Math.floor(interactionState.spectrumOffset + mainViewW),
         ),
       ),
@@ -1752,7 +1834,7 @@ export function createSpectrumRenderController(
         zoom: interactionState.spectrumZoom,
         minZoom: 1,
         maxZoom: getDisplayMaxZoomForTotalFrames({
-          totalFrames: interactionState.spectrumW || timeline.totalFrames || 0,
+          totalFrames: interactionState.spectrumW || renderTimeline.totalFrames || 0,
           maxUnitsPerSecond: state.displaySampling.maxUnitsPerSecond,
         }),
         minUnitsPerSecond: state.displaySampling.minUnitsPerSecond,
@@ -1764,7 +1846,7 @@ export function createSpectrumRenderController(
       mainBaseCtx,
       mainBase.width || mainBase.clientWidth || 1,
       mainBase.height || mainBase.clientHeight || 1,
-      timeline,
+      renderTimeline,
       mainViewport,
       "frames",
       state.displaySampling?.representativeMode || "first-valid",

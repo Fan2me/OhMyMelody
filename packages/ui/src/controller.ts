@@ -46,6 +46,7 @@ import {
 import {
   createProgressiveSpectrumVisualizer,
   type ProgressiveSpectrumVisualizer,
+  type ProgressiveSpectrumPayload,
 } from "./progressive-spectrum-visualizer.js";
 import {
   createSpectrumInteractionController,
@@ -335,6 +336,15 @@ export function createSpectrumUi(options: SpectrumUiOptions): SpectrumUi {
     documentRef,
     getState: () => state,
     getInteractionState: () => interactionState,
+    getSpectrumPayload: () =>
+      progressiveVisualizer
+        ? ({
+            data: progressiveVisualizer.state.spectrumData,
+            width: progressiveVisualizer.state.spectrumW,
+            height: progressiveVisualizer.state.spectrumH,
+            spectrumRevision: progressiveVisualizer.state.spectrumRevision,
+          } as ProgressiveSpectrumPayload)
+        : null,
     mainOverlayRenderer,
     overviewOverlayRenderer,
   });

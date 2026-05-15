@@ -79,7 +79,7 @@ export function createSpectrumRootContainer(documentRef: Document): HTMLDivEleme
   root.style.width = "100%";
   root.style.height = "100%";
   root.style.boxSizing = "border-box";
-  root.style.padding = "12px";
+  // root.style.padding = "12px";
   root.style.background = "transparent";
   return root;
 }

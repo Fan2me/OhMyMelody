@@ -105,7 +105,7 @@ export function getDisplayUnitsPerSecondForZoom({
 export function getDisplayMaxZoomForTotalFrames({
   totalFrames = 0,
   maxUnitsPerSecond = DEFAULT_MAX_UNITS_PER_SECOND,
-  frameRateHz = 100,
+  frameRateHz: _frameRateHz = 100,
 }: {
   totalFrames?: number | undefined;
   maxUnitsPerSecond?: number | undefined;
