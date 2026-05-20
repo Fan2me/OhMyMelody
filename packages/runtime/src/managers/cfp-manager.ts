@@ -1,350 +1,30 @@
 import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import { CFPIndexedDBCache } from "@ohm/core/cache/cfp.js";
-import { isAbortError, throwIfAborted } from "@ohm/core/abort/abort.js";
-import { isPyodideOOMError, splitCFPRangeOnOOM } from "@ohm/core/cfp/cfp.js";
-import { runCFPChunkInPyodide } from "@ohm/core/cfp/chunk.js";
 import {
   CORE_CFP_SCRIPT_URL,
   CORE_CFP_WORKER_MODULE_URL,
 } from "@ohm/core/cfp/index.js";
-import {
-  type CFPBootstrapEnvironment,
-  initializePyodideForCFP,
-  type PyodideLike,
-} from "@ohm/core/cfp/pyodide-bootstrap.js";
 import { createCFPWorkerManager } from "@ohm/core/cfp/worker-manager.js";
+import type { CFPChunkInput, WorkerLike } from "@ohm/core/cfp/types.js";
 import { getModuleLogger } from "@ohm/core/logging/logger.js";
-import type {
-  CFPChunkInput,
-  CFPWorkerErrorMessage,
-  CFPWorkerMessage,
-  CFPWorkerResultMessage,
-  CFPWorkerTimingMessage,
-  WorkerLike,
-} from "@ohm/core/cfp/types.js";
+import {
+  buildCFPCacheKey,
+  commitCFPCache,
+  normalizeCFPBatches,
+} from "../cfp/cache.js";
+import { runCFPOnMainThread } from "../cfp/main-thread-runner.js";
+import {
+  initializeBrowserCFPPyodide,
+  type PyodideWorkerLike,
+} from "../cfp/pyodide-runtime.js";
+import { runCFPWithResidentWorker } from "../cfp/worker-runner.js";
 
 const cfpLogger = getModuleLogger("core.runtime.cfp");
-const processLogger = getModuleLogger("core.runtime.cfp.process");
 
 const PYODIDE_CDN_VERSION = "0.25.1";
 const defaultPyodideScriptUrl = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_CDN_VERSION}/full/pyodide.js`;
 const defaultPyodideIndexURL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_CDN_VERSION}/full/`;
 const defaultCFPScriptUrl = CORE_CFP_SCRIPT_URL;
-const cfpCacheBackend = "runtime-v2";
-
-function buildCFPCacheKey({
-  namespace,
-  fileKey,
-  backend = cfpCacheBackend,
-}: {
-  namespace: string;
-  fileKey: string;
-  backend?: string;
-}): string {
-  return [namespace, fileKey, backend]
-    .map((part) => String(part || "").trim())
-    .filter(Boolean)
-    .join("::");
-}
-
-type PyodideWorkerLike = PyodideLike & {
-  toPy(value: Float32Array): { destroy?: () => void };
-  globals: { set(name: string, value: unknown): void };
-  runPython(code: string): unknown;
-  runPythonAsync(code: string): Promise<unknown>;
-  FS: PyodideLike["FS"] & {
-    readFile(path: string): Uint8Array;
-    unlink?(path: string): void;
-  };
-};
-
-interface CFPProcessOptions {
-  signal?: AbortSignal | null;
-  pauseController?: {
-    waitForResume?: (signal?: AbortSignal | null) => Promise<void> | void;
-  } | null;
-  workerInitTimeoutMs?: number;
-  requireWorker?: boolean;
-}
-
-type PendingChunkPromise = {
-  resolve: (value: CFPBatch) => void;
-  reject: (reason?: unknown) => void;
-};
-
-type WorkerError = Error & { oom?: boolean };
-
-function deriveMinChunkSamples(fs: number): number {
-  return Math.max(1, Math.floor(Math.max(1, Number(fs) || 1) * 0.5));
-}
-
-async function processCFPInputRecursive({
-  input,
-  minChunkSamples,
-  signal,
-  waitIfPaused,
-  processChunk,
-}: {
-  input: CFPChunkInput;
-  minChunkSamples: number;
-  signal?: AbortSignal | null;
-  waitIfPaused: () => Promise<void>;
-  processChunk: (input: CFPChunkInput) => Promise<CFPBatch>;
-}): Promise<CFPBatch[]> {
-  await waitIfPaused();
-  throwIfAborted(signal);
-  try {
-    const batch = await processChunk(input);
-    return [batch];
-  } catch (error) {
-    const oom = !!(error as WorkerError)?.oom || isPyodideOOMError(error);
-    if (oom && input.pcm.length > minChunkSamples * 2) {
-      const splitRange = splitCFPRangeOnOOM(0, input.pcm.length, minChunkSamples);
-      if (splitRange) {
-        processLogger.warn(
-          `CFP OOM retry: [0,${input.pcm.length}) -> [${splitRange.left.start},${splitRange.left.end}) + [${splitRange.right.start},${splitRange.right.end})`,
-        );
-        const leftInput: CFPChunkInput = {
-          pcm: input.pcm.slice(splitRange.left.start, splitRange.left.end),
-          fs: input.fs,
-        };
-        const rightInput: CFPChunkInput = {
-          pcm: input.pcm.slice(splitRange.right.start, splitRange.right.end),
-          fs: input.fs,
-        };
-        const left = await processCFPInputRecursive({
-          input: leftInput,
-          minChunkSamples,
-          signal: signal ?? null,
-          waitIfPaused,
-          processChunk,
-        });
-        const right = await processCFPInputRecursive({
-          input: rightInput,
-          minChunkSamples,
-          signal: signal ?? null,
-          waitIfPaused,
-          processChunk,
-        });
-        return [...left, ...right];
-      }
-    }
-    throw error;
-  }
-}
-
-function createWorkerMessageHandler(
-  pending: Map<string, PendingChunkPromise>,
-): {
-  handleTimingMessage: (message: CFPWorkerTimingMessage) => void;
-  handleWorkerResultMessage: (message: CFPWorkerResultMessage) => void;
-  handleWorkerErrorMessage: (message: CFPWorkerErrorMessage) => void;
-  rejectAllPending: (error: unknown) => void;
-} {
-  function clearPending(id: string): PendingChunkPromise | null {
-    const pendingPromise = pending.get(id);
-    if (!pendingPromise) {
-      return null;
-    }
-    pending.delete(id);
-    return pendingPromise;
-  }
-
-  function resolvePendingResult(id: string, result: CFPBatch): void {
-    const pendingPromise = clearPending(id);
-    if (!pendingPromise) {
-      return;
-    }
-    pendingPromise.resolve(result);
-  }
-
-  function rejectPendingResult(id: string, error: unknown): void {
-    const pendingPromise = clearPending(id);
-    if (!pendingPromise) {
-      return;
-    }
-    pendingPromise.reject(error);
-  }
-
-  function rejectAllPending(error: unknown): void {
-    if (!pending.size) {
-      return;
-    }
-    for (const [id, pendingPromise] of pending.entries()) {
-      pending.delete(id);
-      pendingPromise.reject(error);
-    }
-  }
-
-  function handleTimingMessage(message: CFPWorkerTimingMessage): void {
-    const timingLine =
-      typeof message.phase === "string" ? message.phase : "timing";
-    if (timingLine) {
-      processLogger.info(
-        `${timingLine} [${message.start ?? "?"},${message.end ?? "?"})`,
-      );
-    }
-  }
-
-  function handleWorkerResultMessage(message: CFPWorkerResultMessage): void {
-    const data = new Float32Array(message.dataBuf);
-    const shape = new Int32Array(message.shapeBuf);
-    const batch: CFPBatch = { data, shape };
-    if (typeof message.id === "string" && message.id) {
-      resolvePendingResult(message.id, batch);
-      return;
-    }
-    rejectAllPending(new Error("CFP worker result missing id"));
-  }
-
-  function handleWorkerErrorMessage(message: CFPWorkerErrorMessage): void {
-    const errObj = new Error(message.error || "cfp worker error") as WorkerError;
-    errObj.oom = !!message.oom;
-    if (typeof message.id === "string" && message.id) {
-      rejectPendingResult(message.id, errObj);
-      return;
-    }
-    rejectAllPending(errObj);
-  }
-
-  return {
-    handleTimingMessage,
-    handleWorkerResultMessage,
-    handleWorkerErrorMessage,
-    rejectAllPending,
-  };
-}
-
-async function runCFPOnMainThread({
-  input,
-  pyodide,
-  signal = null,
-  pauseController = null,
-}: {
-  input: CFPChunkInput;
-  pyodide: PyodideLike | null;
-  signal?: AbortSignal | null;
-  pauseController?: CFPProcessOptions["pauseController"];
-}): Promise<CFPBatch[]> {
-  if (!pyodide) {
-    throw new Error("Pyodide is not initialized");
-  }
-
-  async function waitIfPaused(): Promise<void> {
-    await pauseController?.waitForResume?.(signal);
-  }
-
-  return processCFPInputRecursive({
-    input,
-    minChunkSamples: deriveMinChunkSamples(input.fs),
-    signal,
-    waitIfPaused,
-    processChunk: async (segment) => {
-      const result = await runCFPChunkInPyodide({
-        pyodide,
-        pcm: segment.pcm,
-        fs: segment.fs,
-        phase: "main-thread",
-      });
-      return {
-        data: result.data,
-        shape: result.shape,
-      };
-    },
-  });
-}
-
-async function runCFPWithResidentWorker({
-  input,
-  worker,
-  signal = null,
-  pauseController = null,
-}: {
-  input: CFPChunkInput;
-  worker: WorkerLike;
-  signal?: AbortSignal | null;
-  pauseController?: CFPProcessOptions["pauseController"];
-}): Promise<CFPBatch[]> {
-  const { pcm, fs } = input;
-  processLogger.info(
-    `CFP worker process begin: samples=${pcm.length} fs=${fs}`,
-  );
-  const pending = new Map<string, PendingChunkPromise>();
-  const workerRef: { current: WorkerLike } = { current: worker };
-  const handlers = createWorkerMessageHandler(pending);
-  let nextId = 1;
-
-  processLogger.info("CFP worker resident hit, using worker parallel processing.");
-
-  async function processSegment(segment: CFPChunkInput): Promise<CFPBatch> {
-    throwIfAborted(signal);
-    const currentWorker = workerRef.current;
-    if (!currentWorker) {
-      throw new Error("CFP worker is not available");
-    }
-    const id = String(nextId++);
-    return new Promise<CFPBatch>((resolve, reject) => {
-      const arr = segment.pcm.slice();
-      pending.set(id, { resolve, reject });
-      try {
-        currentWorker.postMessage(
-          { cmd: "process", id, pcmBuffer: arr.buffer, fs: segment.fs },
-          [arr.buffer],
-        );
-      } catch (error) {
-        pending.delete(id);
-        reject(error);
-      }
-    });
-  }
-
-  function attachWorkerHandlers(nextWorker: WorkerLike): void {
-    if (!nextWorker) {
-      return;
-    }
-    nextWorker.onmessage = (ev: MessageEvent<CFPWorkerMessage>) => {
-      const message = ev.data || ({} as CFPWorkerMessage);
-      if (message.cmd === "timing") {
-        handlers.handleTimingMessage(message);
-        return;
-      }
-      if (message.cmd === "result") {
-        handlers.handleWorkerResultMessage(message);
-        return;
-      }
-      if (message.cmd === "error") {
-        handlers.handleWorkerErrorMessage(message);
-      }
-    };
-    nextWorker.onerror = () => {
-      handlers.rejectAllPending(new Error("CFP worker runtime error"));
-    };
-  }
-
-  attachWorkerHandlers(worker);
-
-  async function waitIfPaused(): Promise<void> {
-    await pauseController?.waitForResume?.(signal);
-  }
-
-  try {
-    return processCFPInputRecursive({
-      input: { pcm, fs },
-      minChunkSamples: deriveMinChunkSamples(fs),
-      signal: signal ?? null,
-      waitIfPaused,
-      processChunk: processSegment,
-    });
-  } catch (error) {
-    if (isAbortError(error)) {
-      throw error;
-    }
-    processLogger.warn(
-      `CFP worker processing interrupted: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    throw error;
-  }
-}
 
 export interface CFPManagerOptions {
   label?: string;
@@ -398,11 +78,11 @@ export class CFPManager {
   private residentWorker: WorkerLike | null = null;
   private residentWorkerReadyPromise: Promise<WorkerLike | null> | null = null;
   private processQueue: Promise<void> = Promise.resolve();
-  private readonly workerState: {
-    pyodide: PyodideWorkerLike | null;
+  private readonly pyodideState: {
+    runtime: PyodideWorkerLike | null;
     ready: boolean;
   } = {
-    pyodide: null,
+    runtime: null,
     ready: false,
   };
 
@@ -422,24 +102,11 @@ export class CFPManager {
       `runtime cfp manager ready: worker=${CORE_CFP_WORKER_MODULE_URL} pyodide=${this.pyodideScriptUrl} cfp=${this.cfpScriptUrl}`,
     );
     this.cache = new CFPIndexedDBCache({
-      normalizeCFPBatches: normalizeCFPBatches,
+      normalizeCFPBatches,
     });
     this.workerManager = createCFPWorkerManager({
       disableWorker: typeof Worker === "undefined",
-      createWorkerInstance: () => {
-        if (this.createWorkerInstance) {
-          try {
-            return this.createWorkerInstance();
-          } catch {
-            return null;
-          }
-        }
-        try {
-          return new Worker(CORE_CFP_WORKER_MODULE_URL, { type: "module" });
-        } catch {
-          return null;
-        }
-      },
+      createWorkerInstance: () => this.createDefaultWorkerInstance(),
       resolveCFPScriptUrl: () => this.cfpScriptUrl,
       resolvePyodideIndexURL: () => this.pyodideIndexURL,
       resolvePyodideScriptUrl: () => this.pyodideScriptUrl,
@@ -453,6 +120,21 @@ export class CFPManager {
     });
   }
 
+  private createDefaultWorkerInstance(): WorkerLike {
+    if (this.createWorkerInstance) {
+      try {
+        return this.createWorkerInstance();
+      } catch {
+        return null;
+      }
+    }
+    try {
+      return new Worker(CORE_CFP_WORKER_MODULE_URL, { type: "module" });
+    } catch {
+      return null;
+    }
+  }
+
   private enqueueProcess<T>(task: () => Promise<T>): Promise<T> {
     const next = this.processQueue.then(task);
     this.processQueue = next.then(
@@ -462,15 +144,18 @@ export class CFPManager {
     return next;
   }
 
+  private buildCacheKey(fileKey: string): string {
+    return buildCFPCacheKey({
+      namespace: this.analyzerLabel,
+      fileKey,
+    });
+  }
+
   async checkCache({
     fileKey,
     forceRefresh = false,
   }: CFPCheckCacheInput): Promise<CFPCheckCacheResult> {
-    const cacheKey = buildCFPCacheKey({
-      namespace: this.analyzerLabel,
-      fileKey,
-      backend: cfpCacheBackend,
-    });
+    const cacheKey = this.buildCacheKey(fileKey);
 
     if (!forceRefresh && cacheKey) {
       const cached = await this.cache.getCFPCache(cacheKey, {
@@ -521,11 +206,8 @@ export class CFPManager {
         return worker;
       }
 
-      try {
-        worker = this.createWorkerInstance
-          ? this.createWorkerInstance()
-          : new Worker(CORE_CFP_WORKER_MODULE_URL, { type: "module" });
-      } catch {
+      worker = this.createDefaultWorkerInstance();
+      if (!worker) {
         return null;
       }
 
@@ -569,11 +251,7 @@ export class CFPManager {
     forceRefresh = false,
   }: CFPProcessInput): Promise<CFPProcessResult> {
     return this.enqueueProcess(async () => {
-      const cacheKey = buildCFPCacheKey({
-        namespace: this.analyzerLabel,
-        fileKey,
-        backend: cfpCacheBackend,
-      });
+      const cacheKey = this.buildCacheKey(fileKey);
 
       if (batchOffset <= 0) {
         const cacheState = await this.checkCache({
@@ -663,134 +341,30 @@ export class CFPManager {
     startIndex: number;
     complete: boolean;
   }): Promise<void> {
-    if (!cacheKey || !batches.length) {
-      return;
-    }
-    try {
-      for (let localIndex = 0; localIndex < batches.length; localIndex += 1) {
-        const batch = batches[localIndex];
-        if (!batch) {
-          continue;
-        }
-        const index = startIndex + localIndex;
-        await this.cache.appendCFPCacheChunk(cacheKey, batch, {
-          index,
-          reset: index === 0,
-          complete: complete === true && localIndex === batches.length - 1,
-          expectedChunkCount: startIndex + batches.length,
-        });
-      }
-      if (complete) {
-        await this.cache.finalizeCFPCache(cacheKey, {
-          chunkCount: startIndex + batches.length,
-        });
-      }
-      cfpLogger.info(
-        `runtime cfp cache written: ${cacheKey}, batches=${batches.length}, complete=${complete ? "true" : "false"}`,
-      );
-    } catch (error) {
-      cfpLogger.warn(
-        `runtime cfp cache write skipped: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    await commitCFPCache({
+      cache: this.cache,
+      cacheKey,
+      batches,
+      startIndex,
+      complete,
+    });
   }
 
   private async ensurePyodide(): Promise<PyodideWorkerLike> {
-    if (this.workerState.ready && this.workerState.pyodide) {
-      return this.workerState.pyodide;
+    if (this.pyodideState.ready && this.pyodideState.runtime) {
+      return this.pyodideState.runtime;
     }
 
     cfpLogger.info(
       `runtime cfp loading pyodide on main-thread: script=${this.pyodideScriptUrl} index=${this.pyodideIndexURL}`,
     );
-    const browserPyodide = await loadBrowserPyodideRuntime(
-      this.pyodideScriptUrl,
-      this.pyodideIndexURL,
-    );
-
-    this.workerState.pyodide = (await initializePyodideForCFP({
+    this.pyodideState.runtime = await initializeBrowserCFPPyodide({
       pyodideScriptUrl: this.pyodideScriptUrl,
       pyodideIndexURL: this.pyodideIndexURL,
       cfpScriptUrl: this.cfpScriptUrl,
-      packages: ["numpy", "scipy"],
-      environment: {
-        loadScript: async () => true,
-        loadPyodide: async () => browserPyodide,
-      } satisfies CFPBootstrapEnvironment,
-    })) as PyodideWorkerLike;
-    this.workerState.ready = true;
+    });
+    this.pyodideState.ready = true;
     cfpLogger.info("runtime cfp pyodide ready on main-thread");
-    return this.workerState.pyodide;
+    return this.pyodideState.runtime;
   }
-}
-
-function normalizeCFPBatches(rawBatches: unknown): CFPBatch[] {
-  if (!Array.isArray(rawBatches)) {
-    return [];
-  }
-  const normalized: CFPBatch[] = [];
-  for (const item of rawBatches) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-    const typed = item as { data?: unknown; shape?: unknown };
-    if (
-      !(typed.data instanceof Float32Array) ||
-      !(typed.shape instanceof Int32Array)
-    ) {
-      continue;
-    }
-    normalized.push({
-      data: typed.data,
-      shape: typed.shape,
-    });
-  }
-  return normalized;
-}
-
-async function loadBrowserPyodideRuntime(
-  pyodideScriptUrl: string,
-  indexURL: string,
-): Promise<PyodideLike> {
-  const runtimeGlobal = globalThis as typeof globalThis & {
-    loadPyodide?: (options: { indexURL: string }) => Promise<PyodideLike>;
-  };
-
-  if (typeof runtimeGlobal.loadPyodide !== "function") {
-    if (typeof document === "undefined") {
-      throw new Error("Pyodide is not available in current environment");
-    }
-
-    await new Promise<void>((resolve, reject) => {
-      const existingScript = document.querySelector<HTMLScriptElement>(
-        'script[data-ohm-pyodide="true"]',
-      );
-      const finish = () => resolve();
-      const fail = () => reject(new Error("failed to load pyodide runtime"));
-
-      if (existingScript) {
-        if (typeof runtimeGlobal.loadPyodide === "function") {
-          resolve();
-          return;
-        }
-        existingScript.addEventListener("load", finish, { once: true });
-        existingScript.addEventListener("error", fail, { once: true });
-        return;
-      }
-
-      const script = document.createElement("script");
-      script.dataset.ohmPyodide = "true";
-      script.src = pyodideScriptUrl;
-      script.async = true;
-      script.onload = finish;
-      script.onerror = fail;
-      document.head.appendChild(script);
-    });
-  }
-
-  const loadPyodide = runtimeGlobal.loadPyodide?.bind(runtimeGlobal);
-  if (!loadPyodide) {
-    throw new Error("Pyodide is not available in current environment");
-  }
-  return loadPyodide({ indexURL });
 }

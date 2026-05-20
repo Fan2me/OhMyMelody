@@ -1,4 +1,5 @@
 import type { CFPBatch } from "../cache/cfp.js";
+import type { PyodideLike } from "./pyodide-bootstrap.js";
 
 export interface CFPChunkInput {
   pcm: Float32Array;
@@ -15,6 +16,17 @@ export interface CFPWorkerBackend {
 }
 
 export type WorkerLike = Worker | null;
+
+export type PyodideWorkerLike = PyodideLike & {
+  toPy(value: Float32Array): { destroy?: () => void };
+  globals: { set(name: string, value: unknown): void };
+  runPython(code: string): unknown;
+  runPythonAsync(code: string): Promise<unknown>;
+  FS: PyodideLike["FS"] & {
+    readFile(path: string): Uint8Array;
+    unlink?(path: string): void;
+  };
+};
 
 export type CFPChunkResult = CFPBatch;
 
