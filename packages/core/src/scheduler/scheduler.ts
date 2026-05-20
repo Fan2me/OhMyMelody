@@ -37,7 +37,9 @@ export interface RafSchedulerStats {
   taskCount: number;
   fps: number;
   estimatedFps: number;
+  adjacentRafEstimatedFps: number;
   frameBudgetMs: number;
+  adjacentRafFrameBudgetMs: number;
   tasks: Array<{
     id: string;
     priority: number;
@@ -71,6 +73,8 @@ export class RafScheduler {
   private rafId: number | null = null;
   private running = false;
   private recentRafTimes: number[] = [];
+  private lastRafTs: number | null = null;
+  private lastRafIntervalMs = 1000 / 60;
   private readonly nowFn: () => number;
 
   constructor(options: RafSchedulerOptions = {}) {
@@ -108,11 +112,45 @@ export class RafScheduler {
     return Math.max(1, this.recentRafTimes.length || 60);
   }
 
-  private getDynamicFrameBudgetMs(): number {
-    const estimatedFps = this.getEstimatedRafFps();
+  private getAdjacentRafIntervalMs(): number {
+    if (Number.isFinite(this.lastRafIntervalMs) && this.lastRafIntervalMs > 0) {
+      return this.lastRafIntervalMs;
+    }
+    return 1000 / this.getEstimatedRafFps();
+  }
+
+  private getAdjacentRafEstimatedFps(): number {
+    return Math.max(1, 1000 / this.getAdjacentRafIntervalMs());
+  }
+
+  private getDynamicFrameBudgetMs(estimatedFps = this.getEstimatedRafFps()): number {
     const frameIntervalMs = 1000 / estimatedFps;
     const safetyMs = 3;
     return Math.max(4, frameIntervalMs - safetyMs);
+  }
+
+  private getAdjacentRafFrameBudgetMs(): number {
+    return this.getDynamicFrameBudgetMs(this.getAdjacentRafEstimatedFps());
+  }
+
+  private getEffectiveFrameBudgetMs(): number {
+    return Math.min(this.getDynamicFrameBudgetMs(), this.getAdjacentRafFrameBudgetMs());
+  }
+
+  private logFrameBudgets(frameStart: number): void {
+    if (typeof console === 'undefined' || typeof console.debug !== 'function') {
+      return;
+    }
+
+    console.debug('[RafScheduler.runFrame]', {
+      frameStart,
+      countBasedEstimatedFps: this.getEstimatedRafFps(),
+      countBasedFrameBudgetMs: this.getDynamicFrameBudgetMs(),
+      adjacentRafIntervalMs: this.getAdjacentRafIntervalMs(),
+      adjacentRafEstimatedFps: this.getAdjacentRafEstimatedFps(),
+      adjacentRafFrameBudgetMs: this.getAdjacentRafFrameBudgetMs(),
+      effectiveFrameBudgetMs: this.getEffectiveFrameBudgetMs(),
+    });
   }
 
   private getEffectivePriority(priority: number, overdueMs: number): number {
@@ -183,6 +221,10 @@ export class RafScheduler {
       }
 
       const now = this.now();
+      if (this.lastRafTs !== null) {
+        this.lastRafIntervalMs = Math.max(0.001, now - this.lastRafTs);
+      }
+      this.lastRafTs = now;
       this.recentRafTimes.push(now);
       const cutoff = now - 1000;
       while (this.recentRafTimes.length && (this.recentRafTimes[0] ?? 0) < cutoff) {
@@ -221,7 +263,8 @@ export class RafScheduler {
 
   private runFrame(now: number): void {
     const frameStart = now;
-    const frameBudgetMs = this.getDynamicFrameBudgetMs();
+    const frameBudgetMs = this.getEffectiveFrameBudgetMs();
+    this.logFrameBudgets(frameStart);
     const dueTasks = Array.from(this.tasks.entries())
       .filter(([_, taskState]) => (taskState.nextRunTs || 0) <= now)
       .map(([id, taskState]) => ({
@@ -272,7 +315,9 @@ export class RafScheduler {
     const now = this.now();
     const fps = this.recentRafTimes.length;
     const estimatedFps = this.getEstimatedRafFps();
-    const frameBudgetMs = this.getDynamicFrameBudgetMs();
+    const adjacentRafEstimatedFps = this.getAdjacentRafEstimatedFps();
+    const frameBudgetMs = this.getEffectiveFrameBudgetMs();
+    const adjacentRafFrameBudgetMs = this.getAdjacentRafFrameBudgetMs();
     const tasks = Array.from(this.tasks.entries()).map(([id, task]) => ({
       id,
       priority: task.priority,
@@ -286,7 +331,9 @@ export class RafScheduler {
       taskCount: this.tasks.size,
       fps,
       estimatedFps,
+      adjacentRafEstimatedFps,
       frameBudgetMs,
+      adjacentRafFrameBudgetMs,
       tasks,
     };
   }

@@ -404,22 +404,37 @@ async function createSessionWithProvider(modelUrl, provider, mode = "default") {
 
   throw new Error(`Unsupported provider: ${provider}`);
 }
+async function supportsWebGPU() {
+  if (!navigator.gpu) return false
 
-async function createPrioritySession(modelUrl) {
   try {
-    await loadOrtRuntime(webgpuScriptUrl);
-    try {
-      return createSessionWithProvider(modelUrl, "webgpu");
-    } catch (error) {
-      logWarn("WebGPU session init failed, falling back to wasm.", error);
-    }
-  } catch (error) {
-    logWarn(
-      "failed to load WebGPU ORT bundle, falling back to wasm bundle.",
-      error,
-    );
-  }
+    const adapter = await navigator.gpu.requestAdapter()
+    if (!adapter) return false
 
+    const device = await adapter.requestDevice()
+    device.destroy?.()
+
+    return true
+  } catch {
+    return false
+  }
+}
+async function createPrioritySession(modelUrl) {
+  if (await supportsWebGPU()) {
+    try {
+      await loadOrtRuntime(webgpuScriptUrl);
+      try {
+        return createSessionWithProvider(modelUrl, "webgpu");
+      } catch (error) {
+        logWarn("WebGPU session init failed, falling back to wasm.", error);
+      }
+    } catch (error) {
+      logWarn(
+        "failed to load WebGPU ORT bundle, falling back to wasm bundle.",
+        error,
+      );
+    }
+  }
   try {
     await loadOrtRuntime(wasmScriptUrl);
     const wasmEnvSnapshot = snapshotWasmEnv();
