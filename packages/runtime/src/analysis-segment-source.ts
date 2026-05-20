@@ -1,11 +1,10 @@
 import { DEFAULT_TARGET_SAMPLE_RATE } from "@ohm/core/audio/pcm.js";
+import { ANALYSIS_STREAM_CHUNK_SEC } from "./analysis-plan.js";
+import { createSampleQueue, enqueueSamples } from "./sample-queue.js";
 import {
-  ANALYSIS_STREAM_CHUNK_SEC,
-  createSampleQueue,
-  enqueueSamples,
   normalizeStreamingChunk,
   takeNextStreamingSegment,
-} from "./analysis-plan.js";
+} from "./streaming-segments.js";
 import type { AnalysisSessionStore } from "./analysis-session-store.js";
 import type { AnalyzeInput } from "./types.js";
 

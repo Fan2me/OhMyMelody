@@ -2,17 +2,6 @@ import {
   createAnalysisSession,
   type CreateAnalysisSessionOptions,
 } from "./analysis-session.js";
-import type {
-  AnalysisPlan,
-  AnalysisPlanTask,
-  AnalysisState,
-  AnalysisContext,
-  InferenceResult,
-  Analyzer,
-  AnalyzerEventListener,
-  AnalyzerPhaseEvent,
-} from "./analysis.js";
-import { AnalysisPhase } from "./analysis.js";
 
 export interface CreateAnalyzerOptions extends CreateAnalysisSessionOptions {}
 
@@ -30,15 +19,21 @@ export {
 
 export {
   buildAnalysisPlan,
+} from "./analysis-plan.js";
+
+export {
   createSampleQueue,
   drainSamples,
   enqueueSamples,
-  normalizeStreamingChunk,
   padSamplesToLength,
-  takeNextStreamingSegment,
   takeSamples,
   type SampleQueue,
-} from "./analysis-plan.js";
+} from "./sample-queue.js";
+
+export {
+  normalizeStreamingChunk,
+  takeNextStreamingSegment,
+} from "./streaming-segments.js";
 
 export { createAnalysisSession } from "./analysis-session.js";
 export { AudioManager } from "./managers/audio-manager.js";

@@ -1,8 +1,5 @@
 import type { CFPBatch } from "@ohm/core/cache/cfp.js";
 import { estimateDurationSecFromCFPBatches } from "@ohm/core/cache/cfp.js";
-import { decodeAudioRaw } from "@ohm/core/audio/decoder.js";
-import { postProcessDecodedAudio } from "@ohm/core/audio/pcm.js";
-import { captureAudioFromMediaStream } from "@ohm/core/media/stream-capture.js";
 import type {
   AnalyzeExecutionOptions,
   AnalyzeInput,
@@ -107,19 +104,6 @@ export function resolveAnalyzeFileKey(input: AnalyzeInput): string {
   return String(input.fileKey || sourceLabel || "").trim();
 }
 
-export function sourceToBlob(source: AnalyzeInput["source"]): Blob {
-  if (source.kind === "file") {
-    return source.file;
-  }
-  if (source.kind === "blob") {
-    return source.blob;
-  }
-  if (source.kind === "buffer") {
-    return new Blob([source.buffer as unknown as BlobPart]);
-  }
-  throw new Error(`Unsupported analysis source kind: ${source.kind}`);
-}
-
 export function createAnalysisResult<TArtifact>(
   input: AnalyzeInput,
   fileKey: string,
@@ -131,19 +115,4 @@ export function createAnalysisResult<TArtifact>(
     durationSec: estimateDurationSecFromCFPBatches(batches, 0.01),
     artifacts: batches as unknown as readonly TArtifact[],
   };
-}
-
-export async function decodeInputAudio(
-  input: AnalyzeInput,
-): Promise<{ pcm: Float32Array; fs: number; mode?: string }> {
-  if (input.source.kind === "stream") {
-    const audioBuffer = await captureAudioFromMediaStream(input.source.stream);
-    return postProcessDecodedAudio({
-      audioBuffer,
-      sampleRate: audioBuffer.sampleRate,
-    });
-  }
-
-  const blob = sourceToBlob(input.source);
-  return decodeAudioRaw(blob);
 }

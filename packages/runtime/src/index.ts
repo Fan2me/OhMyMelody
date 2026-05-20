@@ -22,15 +22,26 @@ export { AnalysisPhase } from "./analysis.js";
 export {
   createAnalysisState,
   createAnalysisResult,
-  sourceToBlob,
-  decodeInputAudio,
 } from "./analysis.js";
+export { decodeInputAudio, sourceToBlob } from "./audio-input.js";
 
 export {
   createAnalyzer,
   createAnalysisSession,
   buildAnalysisPlan,
 } from "./analyzer.js";
+export {
+  createSampleQueue,
+  drainSamples,
+  enqueueSamples,
+  padSamplesToLength,
+  takeSamples,
+  type SampleQueue,
+} from "./sample-queue.js";
+export {
+  normalizeStreamingChunk,
+  takeNextStreamingSegment,
+} from "./streaming-segments.js";
 export {
   AudioManager,
   type AudioResult,

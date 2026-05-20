@@ -1,5 +1,5 @@
 import { getModuleLogger } from "@ohm/core/logging/logger.js";
-import { decodeInputAudio } from "../analysis.js";
+import { decodeInputAudio } from "../audio-input.js";
 import type { AnalyzeInput } from "../types.js";
 
 const audioLogger = getModuleLogger("core.runtime.audio");
