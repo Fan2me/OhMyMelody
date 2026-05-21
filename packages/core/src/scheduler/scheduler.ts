@@ -264,7 +264,7 @@ export class RafScheduler {
   private runFrame(now: number): void {
     const frameStart = now;
     const frameBudgetMs = this.getEffectiveFrameBudgetMs();
-    this.logFrameBudgets(frameStart);
+    // this.logFrameBudgets(frameStart);
     const dueTasks = Array.from(this.tasks.entries())
       .filter(([_, taskState]) => (taskState.nextRunTs || 0) <= now)
       .map(([id, taskState]) => ({
