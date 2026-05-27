@@ -181,12 +181,16 @@ export function createSpectrumMainOverlayRenderer(
     ctx: CanvasRenderingContext2D,
     width: number,
     height: number,
+    dpr: number,
     displayStart: number,
     displayEnd: number,
   ): void {
     const safeWidth = Math.max(1, Math.round(width));
     const safeHeight = Math.max(1, Math.round(height));
-    const key = `${safeWidth}x${safeHeight}:${displayStart}-${displayEnd}`;
+    const safeDpr = Math.max(1, Number(dpr) || 1);
+    const rasterWidth = Math.max(1, Math.round(safeWidth * safeDpr));
+    const rasterHeight = Math.max(1, Math.round(safeHeight * safeDpr));
+    const key = `${safeWidth}x${safeHeight}@${safeDpr}:${displayStart}-${displayEnd}`;
     if (!cachedPitchAxis || cachedPitchAxis.key !== key) {
       const axisCanvas =
         cachedPitchAxis?.canvas ??
@@ -195,8 +199,8 @@ export function createSpectrumMainOverlayRenderer(
         drawPitchAxis(ctx, width, height, displayStart, displayEnd);
         return;
       }
-      axisCanvas.width = safeWidth;
-      axisCanvas.height = safeHeight;
+      axisCanvas.width = rasterWidth;
+      axisCanvas.height = rasterHeight;
       const axisCtx = axisCanvas.getContext("2d");
       if (!axisCtx) {
         drawPitchAxis(ctx, width, height, displayStart, displayEnd);
@@ -204,7 +208,8 @@ export function createSpectrumMainOverlayRenderer(
       }
       axisCtx.setTransform(1, 0, 0, 1, 0, 0);
       axisCtx.clearRect(0, 0, axisCanvas.width, axisCanvas.height);
-      drawPitchAxis(axisCtx, width, height, displayStart, displayEnd);
+      axisCtx.setTransform(safeDpr, 0, 0, safeDpr, 0, 0);
+      drawPitchAxis(axisCtx, safeWidth, safeHeight, displayStart, displayEnd);
       cachedPitchAxis = {
         key,
         canvas: axisCanvas,
@@ -294,7 +299,9 @@ export function createSpectrumMainOverlayRenderer(
     const { canvas, ctx } = refs;
     const audioElement = getAudioElement();
 
-    const dpr = window.devicePixelRatio || 1;
+    const cssWidth = Math.max(1, canvas.clientWidth || canvas.width || 1);
+    const cssHeight = Math.max(1, canvas.clientHeight || canvas.height || 1);
+    const dpr = Math.max(1, canvas.width / cssWidth, canvas.height / cssHeight);
     const w = Math.max(1, Math.round(canvas.width / dpr));
     const h = Math.max(1, Math.round(canvas.height / dpr));
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -308,7 +315,7 @@ export function createSpectrumMainOverlayRenderer(
     );
     const plotH = Math.max(1, h);
     const plotW = Math.max(1, w);
-    drawPitchAxisCached(ctx, w, h, displayStart, displayEnd);
+    drawPitchAxisCached(ctx, w, h, dpr, displayStart, displayEnd);
 
     const predictionFrames = getPredictionFrames();
     const predictionConfidence = getPredictionConfidence?.() || null;
