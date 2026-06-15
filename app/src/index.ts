@@ -13,6 +13,7 @@ import {
   t,
   SUPPORTED_LANGUAGES,
 } from "./i18n.js";
+import { transcodeMediaToPlayableAudio } from "./ffmpeg-transcode.js";
 
 type ConsoleMethodName = "log" | "info" | "warn" | "error" | "debug";
 
@@ -238,6 +239,7 @@ let previousCfpLen = 0;
 let previousInferenceCount = 0;
 let modelEntries: string[] = Array.from(CORE_MODEL_NAMES);
 const SETTINGS_KEY = "ohmymelody.app.settings.v1";
+const transcodedAudioFileCache = new WeakMap<File, Promise<File>>();
 
 type AppSettings = {
   modelName?: string;
@@ -475,7 +477,7 @@ function escapeHtml(value: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
+    .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
 
@@ -863,18 +865,109 @@ function revokeRecordedMicUrl(): void {
   recordedMicObjectUrl = "";
 }
 
-function bindAudioFile(file: File | null): void {
+function isUnsupportedMediaError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("media source not supported") ||
+    normalized.includes("audio element failed") ||
+    normalized.includes("codec is not supported") ||
+    normalized.includes("failed to load because no supported source was found")
+  );
+}
+
+function setAudioElementSource(file: File): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    if (!audioPlayer) {
+      reject(new Error("audio element is unavailable"));
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    let settled = false;
+    const cleanup = () => {
+      audioPlayer.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      audioPlayer.removeEventListener("error", handleError);
+    };
+    const finish = (handler: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      handler();
+    };
+    const handleLoadedMetadata = () => {
+      finish(() => resolve(objectUrl));
+    };
+    const handleError = () => {
+      const message = audioPlayer.error?.message || "media source not supported";
+      finish(() => {
+        try {
+          audioPlayer.pause();
+        } catch {}
+        audioPlayer.removeAttribute("src");
+        audioPlayer.load();
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch {}
+        reject(new Error(`audio element failed: ${message}`));
+      });
+    };
+
+    audioPlayer.addEventListener("loadedmetadata", handleLoadedMetadata, { once: true });
+    audioPlayer.addEventListener("error", handleError, { once: true });
+    audioPlayer.src = objectUrl;
+    audioPlayer.load();
+  });
+}
+
+async function getTranscodedAudioFile(file: File): Promise<File> {
+  let task = transcodedAudioFileCache.get(file);
+  if (!task) {
+    task = transcodeMediaToPlayableAudio(file);
+    transcodedAudioFileCache.set(file, task);
+  }
+  try {
+    return await task;
+  } catch (error) {
+    transcodedAudioFileCache.delete(file);
+    throw error;
+  }
+}
+
+async function bindAudioFile(file: File | null): Promise<File | null> {
   if (!file || !audioPlayer) {
-    return;
+    return file;
   }
 
-  revokeCurrentAudioUrl();
-  currentAudioObjectUrl = URL.createObjectURL(file);
-  audioPlayer.src = currentAudioObjectUrl;
-  audioPlayer.load();
-  applyPlaybackRate(playbackRate, false);
-  syncAbLoopUi();
-  log(t("logs.audioLoaded", { name: file.name }));
+  const tryBind = async (candidate: File, fromFallback = false): Promise<File> => {
+    revokeCurrentAudioUrl();
+    currentAudioObjectUrl = await setAudioElementSource(candidate);
+    applyPlaybackRate(playbackRate, false);
+    syncAbLoopUi();
+    log(t("logs.audioLoaded", { name: candidate.name }));
+    if (fromFallback) {
+      log(t("logs.audioFallbackReady", { name: candidate.name }));
+    }
+    return candidate;
+  };
+
+  try {
+    return await tryBind(file);
+  } catch (error) {
+    if (!isUnsupportedMediaError(error)) {
+      throw error;
+    }
+    log(t("logs.audioUnsupportedRetrying", { name: file.name }));
+    try {
+      const fallbackFile = await getTranscodedAudioFile(file);
+      return await tryBind(fallbackFile, true);
+    } catch (fallbackError) {
+      log(t("logs.audioFallbackFailed", { message: fallbackError instanceof Error ? fallbackError.message : String(fallbackError) }));
+      throw fallbackError;
+    }
+  }
 }
 
 function handleAudioTimeUpdate(): void {
@@ -948,19 +1041,45 @@ function handleGlobalKeyDown(event: KeyboardEvent): void {
 
 async function analyzeCurrentAudio(sourceFile: File): Promise<void> {
   lastAnalyzedFile = sourceFile;
-  bindAudioFile(sourceFile);
-  ui.setAudioElement(audioPlayer);
+  let analyzeFile = sourceFile;
+  let finalError: unknown = null;
 
   try {
+    const boundFile = await bindAudioFile(sourceFile);
+    analyzeFile = boundFile || sourceFile;
+    ui.setAudioElement(audioPlayer);
     await ui.analyze({
-      input: buildAnalyzeInput(sourceFile),
+      input: buildAnalyzeInput(analyzeFile),
       execution: {
         forceRefresh: forceRefreshCheckbox?.checked === true,
       },
     });
-    log(t("logs.analysisCompleted", { name: sourceFile.name }));
+    if (analyzeFile === sourceFile) {
+      log(t("logs.analysisCompleted", { name: sourceFile.name }));
+    } else {
+      log(t("logs.analysisCompletedWithFallback", { name: sourceFile.name }));
+    }
   } catch (error) {
-    log(t("logs.analysisFailed", { message: error instanceof Error ? error.message : String(error) }));
+    if (analyzeFile === sourceFile && isUnsupportedMediaError(error)) {
+      try {
+        log(t("logs.analysisRetryingWithFallback", { name: sourceFile.name }));
+        const fallbackFile = await getTranscodedAudioFile(sourceFile);
+        await bindAudioFile(fallbackFile);
+        ui.setAudioElement(audioPlayer);
+        await ui.analyze({
+          input: buildAnalyzeInput(fallbackFile),
+          execution: {
+            forceRefresh: forceRefreshCheckbox?.checked === true,
+          },
+        });
+        log(t("logs.analysisCompletedWithFallback", { name: sourceFile.name }));
+        return;
+      } catch (fallbackError) {
+        finalError = fallbackError;
+      }
+    }
+    const resolvedError = finalError ?? error;
+    log(t("logs.analysisFailed", { message: resolvedError instanceof Error ? resolvedError.message : String(resolvedError) }));
   } finally {
     updateStateFromUi();
   }

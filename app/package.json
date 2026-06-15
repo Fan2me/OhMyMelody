@@ -16,6 +16,8 @@
     "clean": "node ../scripts/clean.mjs"
   },
   "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
     "@ohm/core": "workspace:*",
     "@ohm/runtime": "workspace:*",
     "@ohm/ui": "workspace:*",
