@@ -14,6 +14,155 @@ import {
   SUPPORTED_LANGUAGES,
 } from "./i18n.js";
 
+type ConsoleMethodName = "log" | "info" | "warn" | "error" | "debug";
+
+type ConsoleMirrorState = {
+  entries: string[];
+  maxEntries: number;
+  targetId: string;
+  target: HTMLElement | null;
+  originals: Record<ConsoleMethodName, (...data: unknown[]) => void>;
+};
+
+declare global {
+  interface Window {
+    __OHM_CONSOLE_MIRROR__?: ConsoleMirrorState;
+  }
+}
+
+const CONSOLE_METHODS: ConsoleMethodName[] = ["log", "info", "warn", "error", "debug"];
+const CONSOLE_MIRROR_MAX_ENTRIES = 100;
+
+function formatConsoleTimestamp(date = new Date()): string {
+  return `${date.toLocaleTimeString([], { hour12: false })}.${String(date.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function formatConsoleElement(element: Element): string {
+  const id = element.id ? `#${element.id}` : "";
+  const className = typeof element.className === "string" ? element.className.trim() : "";
+  const classes = className ? `.${className.split(/\s+/).filter(Boolean).join(".")}` : "";
+  return `<${element.tagName.toLowerCase()}${id}${classes}>`;
+}
+
+function createConsoleJsonReplacer(): (key: string, value: unknown) => unknown {
+  const seen = new WeakSet<object>();
+  return (_key: string, value: unknown): unknown => {
+    if (value instanceof Error) {
+      return {
+        name: value.name,
+        message: value.message,
+        stack: value.stack,
+      };
+    }
+    if (value instanceof Element) {
+      return formatConsoleElement(value);
+    }
+    if (typeof value === "bigint") {
+      return `${value}n`;
+    }
+    if (typeof value === "function") {
+      return `[Function ${value.name || "anonymous"}]`;
+    }
+    if (typeof value === "object" && value !== null) {
+      if (seen.has(value)) {
+        return "[Circular]";
+      }
+      seen.add(value);
+    }
+    return value;
+  };
+}
+
+function serializeConsoleValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint" ||
+    typeof value === "symbol"
+  ) {
+    return String(value);
+  }
+  if (value instanceof Error) {
+    return value.stack || `${value.name}: ${value.message}`;
+  }
+  if (value instanceof Element) {
+    return formatConsoleElement(value);
+  }
+  if (typeof value === "function") {
+    return `[Function ${value.name || "anonymous"}]`;
+  }
+  try {
+    const json = JSON.stringify(value, createConsoleJsonReplacer(), 2);
+    return json ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function renderConsoleMirror(state: ConsoleMirrorState): void {
+  const target =
+    state.target && document.body.contains(state.target)
+      ? state.target
+      : (document.getElementById(state.targetId) as HTMLElement | null);
+  state.target = target;
+  if (!target) {
+    return;
+  }
+  const shouldStickToBottom = target.scrollHeight - target.clientHeight - target.scrollTop <= 24;
+  target.textContent = state.entries.join("\n");
+  if (shouldStickToBottom || target.scrollTop === 0) {
+    target.scrollTop = target.scrollHeight;
+  }
+}
+
+function pushConsoleMirrorEntry(state: ConsoleMirrorState, method: ConsoleMethodName, args: unknown[]): void {
+  const message = args.length ? args.map((value) => serializeConsoleValue(value)).join(" ") : "(no arguments)";
+  state.entries.push(`[${formatConsoleTimestamp()}] ${method.toUpperCase()} ${message}`);
+  if (state.entries.length > state.maxEntries) {
+    state.entries.splice(0, state.entries.length - state.maxEntries);
+  }
+  renderConsoleMirror(state);
+}
+
+function installConsoleMirror(targetId: string, maxEntries = CONSOLE_MIRROR_MAX_ENTRIES): void {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return;
+  }
+
+  let state = window.__OHM_CONSOLE_MIRROR__;
+  if (!state) {
+    const originals = Object.fromEntries(
+      CONSOLE_METHODS.map((method) => [method, console[method].bind(console)]),
+    ) as ConsoleMirrorState["originals"];
+    const mirrorState: ConsoleMirrorState = {
+      entries: [],
+      maxEntries,
+      targetId,
+      target: null,
+      originals,
+    };
+    state = mirrorState;
+    window.__OHM_CONSOLE_MIRROR__ = mirrorState;
+    for (const method of CONSOLE_METHODS) {
+      console[method] = (...args: unknown[]): void => {
+        mirrorState.originals[method](...args);
+        pushConsoleMirrorEntry(mirrorState, method, args);
+      };
+    }
+  }
+
+  state.maxEntries = maxEntries;
+  state.targetId = targetId;
+  state.target = document.getElementById(targetId) as HTMLElement | null;
+  renderConsoleMirror(state);
+}
+
+installConsoleMirror("consoleOutput");
 await initAppI18n();
 
 const modelNameSelect = document.getElementById("modelName") as HTMLSelectElement | null;
@@ -372,9 +521,7 @@ function stopDebugLoop(): void {
 }
 
 function log(message: string): void {
-  const time = new Date().toLocaleTimeString();
-  const next = `[${time}] ${message}`;
-  console.log(next);
+  console.log(message);
 }
 
 function translateStatus(status: string): string {

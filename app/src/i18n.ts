@@ -25,6 +25,7 @@ const resources = {
         playback: "播放控制",
         display: "显示控制",
         debug: "调试信息",
+        console: "控制台日志",
         spectrum: "音频与频谱",
       },
       controls: {
@@ -73,6 +74,9 @@ const resources = {
         enablePanel: "启用调试面板",
         waiting: "等待频谱数据...",
         panelOff: "调试面板已关闭",
+      },
+      console: {
+        description: "保留浏览器控制台输出，同时显示最近 100 条日志。",
       },
       drop: {
         title: "松开文件即可导入",
@@ -140,6 +144,7 @@ const resources = {
         playback: "Playback",
         display: "Display",
         debug: "Debug",
+        console: "Console Log",
         spectrum: "Audio & Spectrum",
       },
       controls: {
@@ -188,6 +193,9 @@ const resources = {
         enablePanel: "Enable debug panel",
         waiting: "Waiting for spectrum data...",
         panelOff: "Debug panel is off",
+      },
+      console: {
+        description: "Keeps browser console output and mirrors the latest 100 log entries here.",
       },
       drop: {
         title: "Release to import",

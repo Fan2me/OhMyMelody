@@ -355,6 +355,19 @@
       line-height: 1.45;
     }
 
+    .subsection-title {
+      margin: 18px 0 8px;
+      font-size: 15px;
+      color: var(--primary-strong);
+    }
+
+    #consoleOutput {
+      min-height: 180px;
+      max-height: 280px;
+      margin-top: 10px;
+      overflow: auto;
+    }
+
     .control-stack {
       display: grid;
       gap: 10px;
@@ -833,6 +846,9 @@
               </label>
             </div>
             <pre id="debugInfo" data-i18n="debug.waiting">等待频谱数据...</pre>
+            <h3 class="subsection-title" data-i18n="sections.console">控制台日志</h3>
+            <p class="control-hint-line" data-i18n="console.description">保留浏览器控制台输出，同时显示最近 100 条日志。</p>
+            <pre id="consoleOutput" role="log" aria-live="polite"></pre>
           </div>
         </div>
       </article>
