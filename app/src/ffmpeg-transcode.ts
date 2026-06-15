@@ -5,7 +5,14 @@ const OUTPUT_SAMPLE_RATE = 44100;
 const OUTPUT_CHANNELS = 2;
 const OUTPUT_MIME_TYPE = "audio/wav";
 const OUTPUT_EXTENSION = "wav";
-const FFMPEG_CORE_BASE_URL = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+export const FFMPEG_CORE_CDN_VERSION = "0.12.10";
+export const FFMPEG_CORE_BASE_URL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_CDN_VERSION}/dist/esm`;
+
+export type FfmpegAssetUrls = {
+  baseURL: string;
+  coreURL: string;
+  wasmURL: string;
+};
 
 let ffmpegInstance: FFmpeg | null = null;
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
@@ -33,6 +40,14 @@ function buildOutputFileName(name: string): string {
   return `${baseName}.ffmpeg-fallback.${OUTPUT_EXTENSION}`;
 }
 
+export function buildFfmpegAssetUrls(baseURL = FFMPEG_CORE_BASE_URL): FfmpegAssetUrls {
+  return {
+    baseURL,
+    coreURL: `${baseURL}/ffmpeg-core.js`,
+    wasmURL: `${baseURL}/ffmpeg-core.wasm`,
+  };
+}
+
 async function getFfmpeg(): Promise<FFmpeg> {
   if (ffmpegInstance?.loaded) {
     return ffmpegInstance;
@@ -51,12 +66,14 @@ async function getFfmpeg(): Promise<FFmpeg> {
     ffmpegLogBound = true;
   }
 
-  ffmpegLoadPromise = ffmpeg
-    .load({
-      coreURL: await toBlobURL(`${FFMPEG_CORE_BASE_URL}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${FFMPEG_CORE_BASE_URL}/ffmpeg-core.wasm`, "application/wasm"),
-    })
-    .then(() => ffmpeg)
+  ffmpegLoadPromise = (async () => {
+      const assetUrls = buildFfmpegAssetUrls();
+      await ffmpeg.load({
+        coreURL: await toBlobURL(assetUrls.coreURL, "text/javascript"),
+        wasmURL: await toBlobURL(assetUrls.wasmURL, "application/wasm"),
+      });
+      return ffmpeg;
+    })()
     .finally(() => {
       ffmpegLoadPromise = null;
     });

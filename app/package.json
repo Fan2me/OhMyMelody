@@ -10,6 +10,7 @@
     "dev": "vite --host 0.0.0.0 --port 4173",
     "preview": "vite preview",
     "test": "pnpm --dir .. build && node --test test/browser-worker.mjs",
+    "test:unit": "node --experimental-strip-types --test test/ffmpeg-transcode.test.mjs",
     "typecheck": "tsc -b --pretty false",
     "lint": "node ../scripts/lint-package.mjs src",
     "lint:fix": "node ../scripts/lint-package.mjs src --fix",

@@ -1,9 +1,10 @@
-const CACHE_NAME = "ohm-app-v6";
+const CACHE_NAME = "ohm-app-v7";
 const CACHE_PREFIX = "ohm-app-";
 const CDN_HOSTS = new Set(["cdn.jsdelivr.net"]);
 const PYODIDE_CDN_VERSION = "0.25.1";
 const ORT_CDN_VERSION = "1.24.3";
 const FFMPEG_CORE_CDN_VERSION = "0.12.10";
+const FFMPEG_CORE_BASE_URL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_CDN_VERSION}/dist/esm`;
 const APP_BASE_URL = new URL(".", self.location.href);
 const APP_MANIFEST_URL = new URL("./manifest.json", APP_BASE_URL).toString();
 const APP_SHELL_URLS = [
@@ -24,8 +25,8 @@ const DEFAULT_WARM_VENDOR_URLS = [
   `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_CDN_VERSION}/dist/ort.webgpu.min.js`,
   `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_CDN_VERSION}/dist/ort-wasm-simd-threaded.asyncify.mjs`,
   `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_CDN_VERSION}/dist/ort-wasm-simd-threaded.asyncify.wasm`,
-  `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_CDN_VERSION}/dist/umd/ffmpeg-core.js`,
-  `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_CDN_VERSION}/dist/umd/ffmpeg-core.wasm`,
+  `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.js`,
+  `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.wasm`,
 ];
 
 function isCacheableRequest(request) {
