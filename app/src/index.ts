@@ -1,6 +1,7 @@
 import {
   CORE_MODEL_DEFAULT_NAME,
   CORE_MODEL_NAMES,
+  isVideoLikeMediaFile,
 } from "@ohm/core";
 import { CFPManager, createAnalyzer } from "@ohm/runtime";
 import { createSpectrumUi } from "@ohm/ui";
@@ -522,8 +523,99 @@ function stopDebugLoop(): void {
   debugRafId = null;
 }
 
+const LOG_STACK_HELPERS = new Set([
+  "log",
+  "resolveLogCallerLabel",
+  "parseLogStackFrame",
+  "normalizeLogSourcePath",
+]);
+
+function normalizeLogSourcePath(rawSource: string): string {
+  let source = String(rawSource || "").trim();
+  if (!source) {
+    return "unknown";
+  }
+  source = source.split(/[?#]/, 1)[0] || source;
+  if (/^(https?|file):\/\//i.test(source)) {
+    try {
+      source = new URL(source).pathname || source;
+    } catch {}
+  }
+  const normalized = source.replace(/\\/g, "/");
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length >= 3) {
+    return segments.slice(-3).join("/");
+  }
+  if (segments.length > 0) {
+    return segments.join("/");
+  }
+  return normalized || "unknown";
+}
+
+function parseLogStackFrame(
+  stackLine: string,
+): { functionName: string; source: string; line: string } | null {
+  const trimmed = String(stackLine || "").trim().replace(/^at\s+/, "");
+  if (!trimmed) {
+    return null;
+  }
+
+  let functionName = "";
+  let location = trimmed;
+  const chromeMatch = trimmed.match(/^(.*?) \((.+)\)$/);
+  if (chromeMatch) {
+    functionName = chromeMatch[1]?.trim() || "";
+    location = chromeMatch[2]?.trim() || "";
+  } else {
+    const firefoxMatch = trimmed.match(/^(.*?)@(.+)$/);
+    if (firefoxMatch) {
+      functionName = firefoxMatch[1]?.trim() || "";
+      location = firefoxMatch[2]?.trim() || "";
+    }
+  }
+
+  const locationMatch = location.match(/^(.*):(\d+):(\d+)$/);
+  if (!locationMatch) {
+    return null;
+  }
+
+  return {
+    functionName,
+    source: normalizeLogSourcePath(locationMatch[1] || ""),
+    line: locationMatch[2] || "",
+  };
+}
+
+function resolveLogCallerLabel(): string {
+  const stack = new Error().stack;
+  if (!stack) {
+    return "unknown";
+  }
+
+  const frames = stack
+    .split(/\r?\n/)
+    .slice(1)
+    .map((line) => parseLogStackFrame(line))
+    .filter((frame) => frame !== null);
+
+  for (const frame of frames) {
+    if (!frame) {
+      continue;
+    }
+    const functionName = frame.functionName.replace(/^async\s+/, "").trim();
+    if (functionName && LOG_STACK_HELPERS.has(functionName)) {
+      continue;
+    }
+    return functionName
+      ? `${frame.source}:${frame.line} ${functionName}`
+      : `${frame.source}:${frame.line}`;
+  }
+
+  return "unknown";
+}
+
 function log(message: string): void {
-  console.log(message);
+  console.log(`[${resolveLogCallerLabel()}] ${message}`);
 }
 
 function translateStatus(status: string): string {
@@ -876,6 +968,13 @@ function isUnsupportedMediaError(error: unknown): boolean {
   );
 }
 
+function shouldRetryAnalysisWithFallback(file: File, error: unknown): boolean {
+  if (isUnsupportedMediaError(error)) {
+    return true;
+  }
+  return isVideoLikeMediaFile(file);
+}
+
 function setAudioElementSource(file: File): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     if (!audioPlayer) {
@@ -1060,7 +1159,7 @@ async function analyzeCurrentAudio(sourceFile: File): Promise<void> {
       log(t("logs.analysisCompletedWithFallback", { name: sourceFile.name }));
     }
   } catch (error) {
-    if (analyzeFile === sourceFile && isUnsupportedMediaError(error)) {
+    if (analyzeFile === sourceFile && shouldRetryAnalysisWithFallback(sourceFile, error)) {
       try {
         log(t("logs.analysisRetryingWithFallback", { name: sourceFile.name }));
         const fallbackFile = await getTranscodedAudioFile(sourceFile);
