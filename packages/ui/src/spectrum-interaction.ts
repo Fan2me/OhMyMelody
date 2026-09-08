@@ -8,6 +8,7 @@ import {
   getMainViewFrameCount,
   clampSpectrumZoom,
   getPlotMetrics,
+  spectrumFrameToTime,
 } from "./spectrum-layout.js";
 
 export interface SpectrumInteractionControllerDeps {
@@ -298,9 +299,9 @@ export function createSpectrumInteractionController(
         });
       }
       const frameFloat = nextOffset + (relX / plotW) * viewW;
-      const t = Math.max(0, Math.min(state.spectrumW - 1, Math.floor(frameFloat)));
+      const frame = Math.max(0, Math.min(state.spectrumW - 1, frameFloat));
       if (state.spectrumDuration > 0) {
-        void seekAudioTime((t / Math.max(1, state.spectrumW - 1)) * state.spectrumDuration);
+        void seekAudioTime(spectrumFrameToTime(frame, state.spectrumW, state.spectrumDuration));
       }
     };
 

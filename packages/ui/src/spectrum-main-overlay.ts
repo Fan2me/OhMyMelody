@@ -1,5 +1,9 @@
 import type { SpectrumInteractionState, SpectrumUiState } from "./spectrum-state.js";
-import { getMainViewFrameCount } from "./spectrum-layout.js";
+import {
+  getCanvasLogicalSize,
+  getMainViewFrameCount,
+  spectrumTimeToFrame,
+} from "./spectrum-layout.js";
 import {
   getDisplayStrideFramesForZoom,
   getDisplayMaxZoomForTotalFrames,
@@ -299,11 +303,10 @@ export function createSpectrumMainOverlayRenderer(
     const { canvas, ctx } = refs;
     const audioElement = getAudioElement();
 
-    const cssWidth = Math.max(1, canvas.clientWidth || canvas.width || 1);
-    const cssHeight = Math.max(1, canvas.clientHeight || canvas.height || 1);
-    const dpr = Math.max(1, canvas.width / cssWidth, canvas.height / cssHeight);
-    const w = Math.max(1, Math.round(canvas.width / dpr));
-    const h = Math.max(1, Math.round(canvas.height / dpr));
+    const logicalSize = getCanvasLogicalSize(canvas);
+    const dpr = logicalSize.dpr;
+    const w = logicalSize.width;
+    const h = logicalSize.height;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
@@ -339,10 +342,14 @@ export function createSpectrumMainOverlayRenderer(
       Math.max(0, totalFrames - viewW),
     );
     const currentTime = audioElement?.currentTime || 0;
-    const playheadFrame = Math.max(0, currentTime / FRAME_SEC);
+    const playheadFrame = spectrumTimeToFrame(
+      currentTime,
+      totalFrames,
+      interaction.spectrumDuration || fallbackDuration,
+    );
     if (Number.isFinite(playheadFrame) && playheadFrame >= offset && playheadFrame <= offset + viewW) {
       const playheadX = totalFrames > 1
-        ? Math.round(((playheadFrame - offset) / viewW) * plotW) + 0.5
+        ? ((playheadFrame - offset) / viewW) * plotW
         : plotW * 0.5;
       ctx.beginPath();
       ctx.moveTo(playheadX, 0);
