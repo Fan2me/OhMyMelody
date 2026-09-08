@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 4 — in progress
+Phase 4 — completed
 
 ## Problem and goal
 
@@ -133,7 +133,7 @@ Phase 3 期间未运行会写入构建产物的测试/构建命令，以遵守�
 
 ## Implementation status
 
-Task 1 已实现，待创建对应 Git 提交。
+Task 1 已实现并完成主提交；文档补录提交随后完成。
 
 ## Actual changes
 
@@ -166,4 +166,6 @@ Task 1 已实现，待创建对应 Git 提交。
 
 ## Task commit
 
-待提交；提交后补录哈希。
+主提交：`1489404` (`fix(ui): complete Spec task 1 - align spectrum drag`)
+
+文档补录提交：待提交。
