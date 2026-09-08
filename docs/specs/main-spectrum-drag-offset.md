@@ -168,4 +168,4 @@ Task 1 已实现并完成主提交；文档补录提交随后完成。
 
 主提交：`1489404` (`fix(ui): complete Spec task 1 - align spectrum drag`)
 
-文档补录提交：待提交。
+文档补录提交：`3f27d14` (`docs(spec): record spectrum drag task commit`)
