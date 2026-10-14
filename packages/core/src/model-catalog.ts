@@ -5,7 +5,7 @@ export const CORE_MODEL_NAMES = [
   "mftfa_b.onnx"
 ] as const;
 
-export const CORE_MODEL_DEFAULT_NAME = "mamba.onnx";
+export const CORE_MODEL_DEFAULT_NAME = "mamba_a.onnx";
 
 export type CoreModelName = (typeof CORE_MODEL_NAMES)[number];
 
