@@ -1,3 +1,6 @@
 [
-  "mamba.onnx"
+  "mamba_a.onnx",
+  "mamba_b.onnx",
+  "mftfa_a.onnx",
+  "mftfa_n.onnx"
 ]

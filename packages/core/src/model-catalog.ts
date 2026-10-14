@@ -1,5 +1,8 @@
 export const CORE_MODEL_NAMES = [
-  "mamba.onnx",
+  "mamba_a.onnx",
+  "mamba_b.onnx",
+  "mftfa_a.onnx",
+  "mftfa_b.onnx"
 ] as const;
 
 export const CORE_MODEL_DEFAULT_NAME = "mamba.onnx";

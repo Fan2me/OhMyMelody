@@ -5,7 +5,10 @@ const DEFAULT_ORT_WASM_SCRIPT_URL = `https://cdn.jsdelivr.net/npm/onnxruntime-we
 const DEFAULT_ORT_WASM_BASE_URL = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_CDN_VERSION}/dist/`;
 const DEFAULT_MODEL_NAME = "msnet.onnx";
 const MODEL_NAMES = [
-  "mamba.onnx",
+  "mamba_a.onnx",
+  "mamba_b.onnx",
+  "mftfa_a.onnx",
+  "mftfa_b.onnx"
 ];
 const MODEL_URL_BASE = new URL("../../models/", import.meta.url);
 const MODEL_IO = Object.freeze({
